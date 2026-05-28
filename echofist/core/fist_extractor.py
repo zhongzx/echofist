@@ -3,7 +3,6 @@ Fist Extractor 模块
 用于提取和识别CW信号中的特征
 """
 
-
 import numpy as np
 
 
@@ -43,7 +42,9 @@ class FistExtractor:
 
         # 计算过零率（Zero Crossing Rate）
         zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_data)))) / 2
-        features["zero_crossing_rate"] = float(zero_crossings / len(audio_data))
+        features["zero_crossing_rate"] = float(
+            zero_crossings / len(audio_data),
+        )
 
         # 计算频谱特征
         if len(audio_data) > 1:
@@ -108,7 +109,7 @@ class FistExtractor:
                 ends = ends[: len(starts)]
 
             # 创建脉冲列表
-            pulses = list(zip(starts, ends))
+            pulses = list(zip(starts, ends, strict=True))
 
         return pulses
 

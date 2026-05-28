@@ -98,7 +98,7 @@ class MorseDecoder:
     # 反向查找表
     REVERSE_MORSE: dict[str, str] = {v: k for k, v in MORSE_CODE.items()}
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.logger = get_logger("morse_decoder")
         self.config = load_config().morse_decoder
 
@@ -188,7 +188,6 @@ class MorseDecoder:
 
         # 检测信号开始和结束
         above_threshold = envelope > self.signal_threshold
-        below_threshold = envelope <= self.signal_threshold
 
         # 找到信号段的开始和结束索引
         diff = np.diff(above_threshold.astype(int))
@@ -209,7 +208,7 @@ class MorseDecoder:
             signal_ends = signal_ends[: len(signal_starts)]
 
         # 创建符号
-        for start_idx, end_idx in zip(signal_starts, signal_ends):
+        for start_idx, end_idx in zip(signal_starts, signal_ends, strict=True):
             duration = (end_idx - start_idx) / self.sample_rate
 
             # 过滤太短的信号（可能是噪声）
@@ -338,7 +337,9 @@ class MorseDecoder:
 
             # 计算编辑距离（简单版）
             if len(pattern) == len(code_pattern):
-                diff_count = sum(1 for a, b in zip(pattern, code_pattern) if a != b)
+                diff_count = sum(
+                    1 for a, b in zip(pattern, code_pattern, strict=True) if a != b
+                )
                 if diff_count <= 1:
                     return char
 

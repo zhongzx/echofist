@@ -353,9 +353,7 @@ class QSOStateMachine:
 
         return None
 
-    def _transition_to(
-        self, new_state: QSOState, context: str | None = None
-    ) -> None:
+    def _transition_to(self, new_state: QSOState, context: str | None = None) -> None:
         """状态转换"""
         self.previous_state = self.state
         self.state = new_state

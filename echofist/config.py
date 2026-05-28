@@ -2,7 +2,9 @@
 配置管理模块
 """
 
-import os
+import base64
+import hashlib
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +38,17 @@ class QSOConfig(BaseModel):
 
     default_callsign: str | None = Field(None, description="默认呼号")
     default_locator: str | None = Field(None, description="默认网格定位")
+    operator_email: str | None = Field(None, description="默认邮箱")
     auto_log: bool = Field(True, description="自动记录日志")
     log_format: str = Field("ADIF", description="日志格式")
     contest_mode: bool = Field(False, description="比赛模式")
+
+
+class SecurityConfig(BaseModel):
+    """安全配置"""
+
+    api_key_salt_b64: str | None = Field(None, description="API密钥盐（Base64）")
+    api_key_hash_b64: str | None = Field(None, description="API密钥哈希（Base64）")
 
 
 class UIConfig(BaseModel):
@@ -55,8 +65,11 @@ class AppConfig(BaseModel):
     """应用配置"""
 
     kiwi_sdr: KiwiSDRConfig = Field(default_factory=KiwiSDRConfig)
-    morse_decoder: MorseDecoderConfig = Field(default_factory=MorseDecoderConfig)
+    morse_decoder: MorseDecoderConfig = Field(
+        default_factory=MorseDecoderConfig,
+    )
     qso: QSOConfig = Field(default_factory=QSOConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
 
     class Config:
@@ -75,30 +88,36 @@ class ConfigManager:
             config_dir: 配置目录路径，如果为None则使用默认目录
         """
         if config_dir is None:
-            self.config_dir = self.get_default_config_dir()
+            self.config_file = self.get_default_config_file()
+            self.config_dir = self.config_file.parent
         else:
             self.config_dir = Path(config_dir)
-
-        self.config_file = self.config_dir / "config.toml"
+            self.config_file = self.config_dir / "config.toml"
         self._config: AppConfig | None = None
 
         # 确保配置目录存在
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def get_default_config_dir() -> Path:
-        """获取默认配置目录"""
-        # 优先使用XDG配置目录
-        xdg_config_home = os.getenv("XDG_CONFIG_HOME")
-        if xdg_config_home:
-            return Path(xdg_config_home) / "echofist"
+    def get_default_config_file() -> Path:
+        current_file = Path.cwd() / "echofist.toml"
+        if current_file.exists():
+            return current_file
 
-        # 回退到用户主目录
         home = Path.home()
-        if os.name == "nt":  # Windows
-            return home / "AppData" / "Local" / "EchoFist"
-        else:  # macOS/Linux
-            return home / ".config" / "echofist"
+        new_file = home / ".echofist" / "config.toml"
+
+        legacy_file = home / ".config" / "echofist" / "config.toml"
+        if legacy_file.exists() and not new_file.exists():
+            try:
+                config_data = toml.load(legacy_file)
+                new_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(new_file, "w", encoding="utf-8") as f:
+                    toml.dump(config_data, f)
+            except Exception:
+                pass
+
+        return new_file
 
     def load_config(self) -> AppConfig:
         """加载配置"""
@@ -122,7 +141,7 @@ class ConfigManager:
     def save_config(self, config: AppConfig) -> None:
         """保存配置"""
         try:
-            config_dict = config.dict()
+            config_dict = config.model_dump()
             with open(self.config_file, "w", encoding="utf-8") as f:
                 toml.dump(config_dict, f)
             self._config = config
@@ -132,10 +151,13 @@ class ConfigManager:
     def update_config(self, updates: dict[str, Any]) -> AppConfig:
         """更新配置"""
         config = self.load_config()
-        config_dict = config.dict()
+        config_dict = config.model_dump()
 
         # 递归更新配置字典
-        def update_dict(d: dict[str, Any], u: dict[str, Any]) -> dict[str, Any]:
+        def update_dict(
+            d: dict[str, Any],
+            u: dict[str, Any],
+        ) -> dict[str, Any]:
             for k, v in u.items():
                 if isinstance(v, dict) and k in d and isinstance(d[k], dict):
                     d[k] = update_dict(d[k], v)
@@ -194,3 +216,26 @@ def get_config_path() -> Path:
 def reset_config() -> AppConfig:
     """重置配置（便捷函数）"""
     return get_config_manager().reset_to_defaults()
+
+
+def generate_api_key() -> str:
+    raw = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode("ascii")
+    return raw.rstrip("=")
+
+
+def hash_api_key(api_key: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        api_key.encode("utf-8"),
+        salt,
+        200_000,
+    )
+
+
+def generate_api_key_record() -> tuple[str, str, str]:
+    api_key = generate_api_key()
+    salt = secrets.token_bytes(16)
+    digest = hash_api_key(api_key, salt)
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    digest_b64 = base64.b64encode(digest).decode("ascii")
+    return api_key, salt_b64, digest_b64

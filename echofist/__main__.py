@@ -5,9 +5,16 @@ AI辅助等幅电报（CW）通讯软件
 """
 
 import asyncio
+import math
 import sys
+import threading
+import time
+from collections import deque
+from collections.abc import Sequence
+from typing import Any, Literal, TypeVar
 
 import click
+import numpy as np
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -24,6 +31,444 @@ from echofist.ui.dashboard import Dashboard
 
 console = Console()
 logger = setup_logger()
+
+T = TypeVar("T")
+
+
+class _KeyPoller:
+    def __init__(self) -> None:
+        self._is_windows = sys.platform.startswith("win")
+        self._enabled = sys.stdin.isatty() and sys.stdout.isatty()
+        self._old_term_settings: Any | None = None
+        self._fd: int | None = None
+        self._buffer: deque[str] = deque()
+
+    def __enter__(self) -> "_KeyPoller":
+        if not self._enabled:
+            return self
+        if self._is_windows:
+            return self
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        self._fd = fd
+        self._old_term_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any | None,
+    ) -> None:
+        if not self._enabled:
+            return
+        if self._is_windows:
+            return
+        if self._old_term_settings is None:
+            return
+        import termios
+
+        termios.tcsetattr(
+            sys.stdin.fileno(),
+            termios.TCSADRAIN,
+            self._old_term_settings,
+        )
+        self._old_term_settings = None
+        self._fd = None
+        self._buffer.clear()
+
+    def _read_char(self, timeout_seconds: float = 0.0) -> str | None:
+        if not self._enabled:
+            return None
+        if self._is_windows:
+            import msvcrt
+
+            if not msvcrt.kbhit():
+                return None
+            return msvcrt.getwch()
+        if self._buffer:
+            return self._buffer.popleft()
+        if self._fd is None:
+            return None
+        import os
+        import select
+
+        r, _, _ = select.select([self._fd], [], [], float(timeout_seconds))
+        if not r:
+            return None
+        try:
+            data = os.read(self._fd, 32)
+        except BlockingIOError:
+            return None
+        if not data:
+            return None
+        text = data.decode("latin-1")
+        self._buffer.extend(text)
+        return self._buffer.popleft() if self._buffer else None
+
+    def _get_event_windows(
+        self,
+    ) -> Literal["up", "down", "left", "right", "enter", "esc", "q", "b"] | None:
+        ch = self._read_char()
+        if ch is None:
+            return None
+        mapping: dict[str, Literal["enter", "esc", "q", "b"]] = {
+            "q": "q",
+            "Q": "q",
+            "b": "b",
+            "B": "b",
+            "\r": "enter",
+            "\x1b": "esc",
+        }
+        mapped = mapping.get(ch)
+        if mapped is not None:
+            return mapped
+        if ch not in {"\x00", "\xe0"}:
+            return None
+        ch2 = self._read_char()
+        if ch2 is None:
+            return None
+        arrow_map: dict[int, Literal["up", "down", "left", "right"]] = {
+            72: "up",
+            80: "down",
+            75: "left",
+            77: "right",
+        }
+        return arrow_map.get(ord(ch2))
+
+    def _read_escape_sequence(self) -> str:
+        seq = "\x1b"
+        deadline = time.monotonic() + 0.12
+        while len(seq) < 8 and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            ch_next = self._read_char(timeout_seconds=min(0.02, remaining))
+            if ch_next is None:
+                break
+            seq += ch_next
+            if seq.startswith("\x1b[") and len(seq) >= 3 and ("@" <= seq[-1] <= "~"):
+                break
+        return seq
+
+    def _parse_escape_sequence(
+        self,
+        seq: str,
+    ) -> Literal["up", "down", "left", "right", "esc"] | None:
+        if seq == "\x1b":
+            return "esc"
+        if seq.startswith("\x1b[") or seq.startswith("\x1bO"):
+            mapping: dict[str, Literal["up", "down", "left", "right"]] = {
+                "A": "up",
+                "B": "down",
+                "C": "right",
+                "D": "left",
+            }
+            return mapping.get(seq[-1])
+        return None
+
+    def _get_event_posix(
+        self,
+    ) -> Literal["up", "down", "left", "right", "enter", "esc", "q", "b"] | None:
+        ch = self._read_char()
+        if ch is None:
+            return None
+        mapping: dict[str, Literal["enter", "q", "b"]] = {
+            "q": "q",
+            "Q": "q",
+            "b": "b",
+            "B": "b",
+            "\n": "enter",
+            "\r": "enter",
+        }
+        mapped = mapping.get(ch)
+        if mapped is not None:
+            return mapped
+        if ch != "\x1b":
+            return None
+        seq = self._read_escape_sequence()
+        return self._parse_escape_sequence(seq)
+
+    def get_event(
+        self,
+    ) -> (
+        Literal[
+            "up",
+            "down",
+            "left",
+            "right",
+            "enter",
+            "esc",
+            "q",
+            "b",
+        ]
+        | None
+    ):
+        if not self._enabled:
+            return None
+        if self._is_windows:
+            return self._get_event_windows()
+        return self._get_event_posix()
+
+
+def _default_server_candidates() -> list[str]:
+    return [
+        "85.147.201.225:8073",
+        "db0ovp.de:8073",
+        "ve3hoa.ddns.net:8074",
+        "kiwisdr.sdrham.com:8073",
+        "sdr.oe3xbu.at:8073",
+        "sdr.oe3xwu.at:8073",
+        "kiwisdr.ka7u.net:8073",
+        "sdr.k5qax.org:8073",
+    ]
+
+
+def _band_presets() -> dict[str, list[tuple[str, float]]]:
+    return {
+        "40m": [
+            ("7.030 QRP Calling", 7.030),
+            ("7.023 常用", 7.023),
+        ],
+        "20m": [
+            ("14.060 QRP Calling", 14.060),
+            ("14.100 NCDXF 信标", 14.100),
+        ],
+        "17m": [
+            ("18.110 NCDXF 信标", 18.110),
+        ],
+        "15m": [
+            ("21.060 QRP Calling", 21.060),
+            ("21.150 NCDXF 信标", 21.150),
+        ],
+        "12m": [
+            ("24.930 NCDXF 信标", 24.930),
+        ],
+        "10m": [
+            ("28.060 QRP Calling", 28.060),
+            ("28.200 NCDXF 信标", 28.200),
+        ],
+    }
+
+
+def _select_menu(
+    *,
+    title: str,
+    options: Sequence[T],
+    render_option: "callable[[T], str]",
+    default_index: int = 0,
+) -> T | None:
+    if not options:
+        return None
+    index = max(0, min(int(default_index), len(options) - 1))
+    help_text = "↑↓ 选择 | Enter 确认 | Esc 取消"
+
+    def build_panel() -> Panel:
+        body = Text()
+        for i, opt in enumerate(options):
+            prefix = "› " if i == index else "  "
+            style = "bold cyan" if i == index else "dim"
+            body.append(prefix + render_option(opt) + "\n", style=style)
+        body.append("\n" + help_text, style="dim")
+        return Panel(body, title=title, border_style="cyan")
+
+    with (
+        _KeyPoller() as poller,
+        Live(
+            build_panel(),
+            console=console,
+            screen=False,
+            refresh_per_second=20,
+        ) as live,
+    ):
+        while True:
+            event = poller.get_event()
+            if event is None:
+                continue
+            if event == "esc":
+                return None
+            if event == "enter":
+                return options[index]
+            if event in {"up", "left"}:
+                index = (index - 1) % len(options)
+                live.update(build_panel())
+            elif event in {"down", "right"}:
+                index = (index + 1) % len(options)
+                live.update(build_panel())
+
+
+def _prompt_monitor_wizard(
+    *,
+    servers: tuple[str, ...],
+    band: str | None,
+    freq: float | None,
+    with_default_servers: bool,
+) -> tuple[tuple[str, ...], str, float]:
+    presets = _band_presets()
+    band_choices = list(presets.keys())
+
+    resolved_servers = servers
+    if not resolved_servers:
+        candidates = _default_server_candidates() if with_default_servers else []
+        primary = _select_menu(
+            title="选择主服务器",
+            options=candidates,
+            render_option=lambda s: str(s),
+            default_index=0,
+        )
+        if primary is None:
+            raise click.Abort()
+        resolved: list[str] = [str(primary)]
+        remaining = [s for s in candidates if s != primary]
+        if remaining:
+            add_backup = _select_menu(
+                title="添加备用服务器？",
+                options=["不添加", "添加"],
+                render_option=lambda s: str(s),
+                default_index=0,
+            )
+            if add_backup == "添加":
+                backup = _select_menu(
+                    title="选择备用服务器",
+                    options=remaining,
+                    render_option=lambda s: str(s),
+                    default_index=0,
+                )
+                if backup is None:
+                    raise click.Abort()
+                resolved.append(str(backup))
+        resolved_servers = tuple(resolved)
+
+    resolved_band = band
+    if resolved_band is None and freq is None:
+        selected_band = _select_menu(
+            title="选择频段",
+            options=band_choices,
+            render_option=lambda s: str(s),
+            default_index=(band_choices.index("40m") if "40m" in band_choices else 0),
+        )
+        if selected_band is None:
+            raise click.Abort()
+        resolved_band = str(selected_band)
+    if resolved_band is None:
+        resolved_band = "40m"
+
+    resolved_freq = freq
+    if resolved_freq is None:
+        options = presets.get(resolved_band, presets["40m"])
+        labels = [label for label, _ in options]
+        choice = _select_menu(
+            title="选择守听频点",
+            options=labels,
+            render_option=lambda s: str(s),
+            default_index=0,
+        )
+        if choice is None:
+            raise click.Abort()
+        resolved_freq = dict(options)[str(choice)]
+
+    return resolved_servers, resolved_band, float(resolved_freq)
+
+
+class AudioPlayer:
+    def __init__(
+        self,
+        input_rate: int,
+        *,
+        output_rate: int = 48000,
+        gain: float = 0.4,
+        max_buffer_seconds: float = 2.0,
+    ) -> None:
+        try:
+            import sounddevice as sd
+            from scipy.signal import resample_poly
+        except ImportError as e:
+            raise ImportError(
+                "Audio playback requires sounddevice and scipy. "
+                "Please install them with: pip install sounddevice scipy"
+            ) from e
+
+        self._sd = sd
+        self._resample_poly = resample_poly
+        self._input_rate = int(input_rate)
+        self._output_rate = int(output_rate)
+        self._gain = float(gain)
+        self._lock = threading.Lock()
+        self._buffer: deque[float] = deque()
+        self._max_samples = int(self._output_rate * max_buffer_seconds)
+        self._stream: Any | None = None
+        self._logger = setup_logger()
+
+        g = math.gcd(self._input_rate, self._output_rate)
+        self._up = self._output_rate // g
+        self._down = self._input_rate // g
+
+    def start(self) -> None:
+        def callback(
+            outdata: Any,
+            frames: int,
+            _time: Any,
+            status: Any,
+        ) -> None:
+            if status:
+                self._logger.warning(f"Audio callback status: {status}")
+            out = np.zeros(frames, dtype=np.float32)
+            with self._lock:
+                for i in range(frames):
+                    if not self._buffer:
+                        break
+                    out[i] = self._buffer.popleft()
+            outdata[:] = out.reshape(-1, 1)
+
+        self._stream = self._sd.OutputStream(
+            samplerate=self._output_rate,
+            channels=1,
+            dtype="float32",
+            callback=callback,
+            blocksize=1024,
+        )
+        self._stream.start()
+
+    def stop(self) -> None:
+        if self._stream is None:
+            return
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception as e:
+            self._logger.error(f"Error stopping audio stream: {e}")
+        finally:
+            self._stream = None
+
+    def buffered_ms(self) -> float:
+        with self._lock:
+            n = len(self._buffer)
+        return (n / float(self._output_rate)) * 1000.0
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buffer.clear()
+
+    def feed(self, samples: np.ndarray) -> None:
+        if samples.size == 0:
+            return
+
+        x = np.asarray(samples, dtype=np.float32)
+        y = self._resample_poly(x, self._up, self._down).astype(
+            np.float32,
+            copy=False,
+        )
+        y = np.clip(y * self._gain, -1.0, 1.0)
+
+        with self._lock:
+            # 更高效地添加和裁剪
+            self._buffer.extend(float(v) for v in y)
+            overflow = len(self._buffer) - self._max_samples
+            if overflow > 0:
+                # 一次性移除多余的样本
+                for _ in range(overflow):
+                    self._buffer.popleft()
 
 
 def print_banner() -> None:
@@ -67,33 +512,139 @@ def print_kiwi_servers(servers: list) -> None:
 
 
 async def monitor_mode(
-    server: str, freq: float, bandwidth: int = 500, mode: str = "am"
-) -> None:
+    servers: tuple[str, ...],
+    freq: float,
+    bandwidth: int = 500,
+    mode: str = "am",
+    password: str = "",
+    ident_user: str | None = None,
+    play_audio: bool = False,
+    audio_gain: float = 0.4,
+    *,
+    with_default_servers: bool = True,
+    auto_switch: bool = True,
+    interactive: bool = False,
+) -> Literal["exit", "restart"]:
     """监听模式"""
     console.print("[green]启动监听模式[/green]")
-    console.print(f"服务器: [cyan]{server}[/cyan]")
+    console.print(f"服务器: [cyan]{', '.join(servers)}[/cyan]")
     console.print(f"频率: [yellow]{freq} MHz[/yellow]")
     console.print(f"带宽: [blue]{bandwidth} Hz[/blue]")
     console.print(f"模式: [magenta]{mode.upper()}[/magenta]")
     console.print()
 
-    # 创建客户端
-    client = KiwiSDRClient(server)
+    default_servers = _default_server_candidates()
+    server_candidates: list[str] = []
+    if interactive:
+        base_candidates = list(servers)
+    else:
+        base_candidates = list(servers) + (
+            default_servers if with_default_servers else []
+        )
+    for s in base_candidates:
+        if s and s not in server_candidates:
+            server_candidates.append(s)
+    if not server_candidates:
+        raise click.ClickException("未提供可用的 KiwiSDR 服务器")
+
+    server_index = 0
+    current_server = server_candidates[server_index]
+    client: KiwiSDRClient | None = None
     decoder = MorseDecoder()
     dashboard = Dashboard()
+    player: AudioPlayer | None = None
+    audio_chunks_total = 0
+    window_start = asyncio.get_running_loop().time()
+    window_chunks = 0
+    chunks_rate = 0.0
+    last_rms = 0.0
+    last_reconnect_attempt = 0.0
+    reconnect_count = 0
+    server_switch_count = 0
+    consecutive_reconnects = 0
+    last_good_audio_at = time.monotonic()
+    last_switch_at = time.monotonic()
+    server_fail_until: dict[str, float] = {}
 
     try:
-        # 连接服务器
-        await client.connect()
+        reconnect_warn_seconds = 6.0
+        reconnect_after_seconds = 20.0
+        switch_after_seconds = 60.0
+        server_cooldown_seconds = 120.0
+        min_switch_interval_seconds = 30.0
+
+        async def connect_and_start(
+            target_server: str,
+            *,
+            count_as_reconnect: bool,
+        ) -> KiwiSDRClient:
+            nonlocal reconnect_count, consecutive_reconnects
+            new_client = KiwiSDRClient(
+                target_server,
+                password=password,
+                ident_user=ident_user,
+            )
+            await new_client.connect()
+            await new_client.set_frequency(freq)
+            await new_client.set_mode(mode)
+            await new_client.set_bandwidth(bandwidth)
+            await new_client.start_audio_stream()
+            if count_as_reconnect:
+                reconnect_count += 1
+                consecutive_reconnects += 1
+            return new_client
+
+        connected = False
+        for idx, candidate in enumerate(server_candidates):
+            try:
+                server_index = idx
+                current_server = candidate
+                dashboard.update(
+                    is_connected=False,
+                    connection_state="连接中",
+                    server=current_server,
+                    play_audio_enabled=play_audio,
+                    error_message=None,
+                )
+                client = await connect_and_start(
+                    current_server,
+                    count_as_reconnect=False,
+                )
+                connected = True
+                break
+            except Exception as e:
+                logger.warning(f"初始连接失败: {candidate} ({e})")
+                server_fail_until[candidate] = (
+                    time.monotonic() + server_cooldown_seconds
+                )
+                client = None
+
+        if not connected or client is None:
+            if interactive:
+                console.print(
+                    Panel(
+                        "无法连接到所选源，请返回重新选择。",
+                        title="连接失败",
+                        border_style="red",
+                    )
+                )
+                return "restart"
+            raise ConnectionError("无法连接到任意 KiwiSDR 服务器")
+        dashboard.update(
+            is_connected=True,
+            connection_state=None,
+            server=current_server,
+            play_audio_enabled=play_audio,
+            error_message=None,
+        )
         console.print("[green]✓ 已连接到KiwiSDR服务器[/green]")
 
-        # 设置频率和模式
-        await client.set_frequency(freq)
-        await client.set_mode(mode)
-        await client.set_bandwidth(bandwidth)
-
-        # 启动音频流
-        await client.start_audio_stream()
+        if play_audio:
+            player = AudioPlayer(
+                input_rate=decoder.sample_rate,
+                gain=audio_gain,
+            )
+            player.start()
 
         # 创建实时显示
         layout = Layout()
@@ -101,19 +652,243 @@ async def monitor_mode(
             Layout(name="header", size=3),
             Layout(name="waterfall", ratio=2),
             Layout(name="decoded", ratio=3),
-            Layout(name="status", size=5),
+            Layout(name="status", size=13),
         )
 
-        with Live(layout, console=console, screen=False, refresh_per_second=4):
+        control: Literal["exit", "restart"] = "exit"
+        with (
+            _KeyPoller() as poller,
+            Live(
+                layout,
+                console=console,
+                screen=False,
+                refresh_per_second=4,
+            ),
+        ):
             while True:
+                event = poller.get_event()
+                if event == "q":
+                    control = "exit"
+                    break
+                if event == "b":
+                    control = "restart"
+                    break
+
                 # 获取音频数据
-                audio_data = await client.get_audio_chunk()
+                audio_data = await client.get_audio_chunk(timeout_seconds=0.25)
+                now = asyncio.get_running_loop().time()
+                audio_age = client.get_last_audio_age_seconds()
+                if audio_age < 0.5:
+                    last_good_audio_at = time.monotonic()
+                    consecutive_reconnects = 0
+                dt = now - window_start
+                if dt >= 1.0:
+                    chunks_rate = window_chunks / dt
+                    window_start = now
+                    window_chunks = 0
                 if audio_data is None:
+                    stalled_seconds = time.monotonic() - last_good_audio_at
+                    should_reconnect = audio_age >= reconnect_after_seconds
+                    should_switch = (
+                        auto_switch
+                        and len(server_candidates) > 1
+                        and stalled_seconds >= switch_after_seconds
+                        and consecutive_reconnects >= 2
+                        and (time.monotonic() - last_switch_at)
+                        >= min_switch_interval_seconds
+                    )
+                    if should_switch:
+                        old_server = current_server
+                        n_candidates = len(server_candidates)
+                        next_index = (server_index + 1) % n_candidates
+                        candidate_indices = [
+                            (next_index + i) % n_candidates for i in range(n_candidates)
+                        ]
+                        consecutive_reconnects = 0
+                        dashboard.update(
+                            is_connected=False,
+                            connection_state="切换中",
+                            server=current_server,
+                            error_message=(
+                                f"服务器不稳定，准备切换 {old_server} → ..."
+                            ),
+                            reconnect_count=reconnect_count,
+                            server_switch_count=server_switch_count,
+                        )
+                        layout["header"].update(dashboard.render_header())
+                        layout["waterfall"].update(dashboard.render_waterfall())
+                        layout["decoded"].update(dashboard.render_decoded_text())
+                        layout["status"].update(dashboard.render_status())
+                        if player is not None:
+                            player.clear()
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.4)
+                        switched = False
+                        last_error: str | None = None
+                        for idx in candidate_indices:
+                            candidate = server_candidates[idx]
+                            fail_until = server_fail_until.get(candidate, 0.0)
+                            if time.monotonic() < fail_until:
+                                continue
+                            dashboard.update(
+                                server=candidate,
+                                error_message=(
+                                    f"服务器不稳定，切换 {old_server} → {candidate}"
+                                ),
+                            )
+                            layout["header"].update(dashboard.render_header())
+                            layout["status"].update(dashboard.render_status())
+                            try:
+                                client = await connect_and_start(
+                                    candidate,
+                                    count_as_reconnect=True,
+                                )
+                                current_server = candidate
+                                server_index = idx
+                                server_switch_count += 1
+                                loop_now = asyncio.get_running_loop().time()
+                                window_start = loop_now
+                                window_chunks = 0
+                                dashboard.update(
+                                    is_connected=True,
+                                    connection_state=None,
+                                    server=current_server,
+                                    error_message=None,
+                                    server_switch_count=server_switch_count,
+                                )
+                                last_good_audio_at = time.monotonic()
+                                last_switch_at = time.monotonic()
+                                switched = True
+                                break
+                            except Exception as e:
+                                last_error = str(e)
+                                server_fail_until[candidate] = (
+                                    time.monotonic() + server_cooldown_seconds
+                                )
+                                continue
+
+                        if not switched:
+                            dashboard.update(
+                                error_message=(f"切换失败（{last_error}），稍后重试"),
+                                server_switch_count=server_switch_count,
+                            )
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    if should_reconnect:
+                        mono_now = time.monotonic()
+                        if mono_now - last_reconnect_attempt >= 2.0:
+                            last_reconnect_attempt = mono_now
+                            dashboard.update(
+                                frequency=freq,
+                                bandwidth=bandwidth,
+                                mode=mode,
+                                signal_strength=client.get_signal_strength(),
+                                is_connected=False,
+                                connection_state="重连中",
+                                error_message=(
+                                    f"音频断流 {audio_age:.1f}s，正在重连..."
+                                ),
+                                server=current_server,
+                                audio_chunks_total=audio_chunks_total,
+                                audio_chunks_rate=chunks_rate,
+                                audio_queue_size=client.get_audio_queue_size(),
+                                audio_rms=last_rms,
+                                audio_last_age=audio_age,
+                                playback_buffer_ms=(
+                                    player.buffered_ms() if player else 0.0
+                                ),
+                                reconnect_count=reconnect_count,
+                                server_switch_count=server_switch_count,
+                            )
+                            layout["header"].update(dashboard.render_header())
+                            layout["waterfall"].update(dashboard.render_waterfall())
+                            layout["decoded"].update(dashboard.render_decoded_text())
+                            layout["status"].update(dashboard.render_status())
+                            if player is not None:
+                                player.clear()
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.4)
+                            try:
+                                client = await connect_and_start(
+                                    current_server,
+                                    count_as_reconnect=True,
+                                )
+                                loop_now = asyncio.get_running_loop().time()
+                                window_start = loop_now
+                                window_chunks = 0
+                                dashboard.update(
+                                    is_connected=True,
+                                    connection_state=None,
+                                    server=current_server,
+                                    error_message=None,
+                                )
+                                last_good_audio_at = time.monotonic()
+                            except Exception as e:
+                                server_fail_until[current_server] = (
+                                    time.monotonic() + server_cooldown_seconds
+                                )
+                                if auto_switch and len(server_candidates) > 1:
+                                    dashboard.update(
+                                        connection_state="切换中",
+                                        error_message=(f"重连失败（{e}），尝试切换..."),
+                                    )
+                                else:
+                                    dashboard.update(
+                                        error_message=f"重连失败（{e}）",
+                                    )
+                    else:
+                        if audio_age >= reconnect_warn_seconds:
+                            dashboard.update(
+                                error_message=(
+                                    f"音频暂停 {audio_age:.1f}s，等待恢复..."
+                                ),
+                            )
+                    dashboard.update(
+                        frequency=freq,
+                        bandwidth=bandwidth,
+                        mode=mode,
+                        signal_strength=client.get_signal_strength(),
+                        is_connected=client.connected,
+                        connection_state=None,
+                        server=current_server,
+                        audio_chunks_total=audio_chunks_total,
+                        audio_chunks_rate=chunks_rate,
+                        audio_queue_size=client.get_audio_queue_size(),
+                        audio_rms=last_rms,
+                        audio_last_age=audio_age,
+                        playback_buffer_ms=(player.buffered_ms() if player else 0.0),
+                        reconnect_count=reconnect_count,
+                        server_switch_count=server_switch_count,
+                    )
+                    layout["header"].update(dashboard.render_header())
+                    layout["waterfall"].update(dashboard.render_waterfall())
+                    layout["decoded"].update(dashboard.render_decoded_text())
+                    layout["status"].update(dashboard.render_status())
                     await asyncio.sleep(0.1)
                     continue
+                drained = client.drain_audio_chunks(max_chunks=8)
+                if drained:
+                    drained.insert(0, audio_data)
+                    audio_data = drained[-1]
+                else:
+                    drained = [audio_data]
+
+                if player is not None:
+                    for chunk in drained:
+                        player.feed(chunk)
 
                 # 解码摩尔斯电码
                 decoded_text, confidence = decoder.decode(audio_data)
+                audio_chunks_total += len(drained)
+                window_chunks += len(drained)
+                last_rms = float(np.sqrt(np.mean(audio_data * audio_data)))
 
                 # 更新仪表板
                 dashboard.update(
@@ -123,6 +898,17 @@ async def monitor_mode(
                     decoded_text=decoded_text,
                     confidence=confidence,
                     signal_strength=client.get_signal_strength(),
+                    is_connected=client.connected,
+                    connection_state=None,
+                    server=current_server,
+                    audio_chunks_total=audio_chunks_total,
+                    audio_chunks_rate=chunks_rate,
+                    audio_queue_size=client.get_audio_queue_size(),
+                    audio_rms=last_rms,
+                    audio_last_age=audio_age,
+                    playback_buffer_ms=player.buffered_ms() if player else 0.0,
+                    reconnect_count=reconnect_count,
+                    server_switch_count=server_switch_count,
                 )
 
                 # 渲染布局
@@ -133,18 +919,84 @@ async def monitor_mode(
 
                 await asyncio.sleep(0.25)
 
+        return control
+
     except KeyboardInterrupt:
         console.print("\n[yellow]正在停止监听...[/yellow]")
+        return "exit"
     except Exception as e:
         logger.error(f"监听模式错误: {e}")
         console.print(f"[red]错误: {e}[/red]")
+        return "exit"
     finally:
         if client:
             await client.disconnect()
+        if player is not None:
+            player.stop()
+
+
+async def probe_mode(
+    server: str,
+    freq: float,
+    bandwidth: int,
+    mode: str,
+    password: str,
+    ident_user: str | None,
+    seconds: float,
+) -> None:
+    client = KiwiSDRClient(server, password=password, ident_user=ident_user)
+    decoder = MorseDecoder()
+
+    await client.connect()
+    await client.set_frequency(freq)
+    await client.set_mode(mode)
+    await client.set_bandwidth(bandwidth)
+    await client.start_audio_stream()
+
+    start = asyncio.get_running_loop().time()
+    chunks = 0
+    decoded_lines = 0
+    last_rssi = 0.0
+
+    while asyncio.get_running_loop().time() - start < seconds:
+        audio_data = await client.get_audio_chunk()
+        if audio_data is None:
+            await asyncio.sleep(0.05)
+            continue
+        chunks += 1
+        last_rssi = client.get_signal_strength()
+        decoded_text, confidence = decoder.decode(audio_data)
+        if decoded_text and confidence >= 0.7:
+            decoded_lines += 1
+            console.print(f"[dim]{decoded_text}[/dim]")
+
+    await client.disconnect()
+    console.print(
+        Panel(
+            "\n".join(
+                [
+                    f"服务器: {server}",
+                    f"模式: {mode.upper()}",
+                    f"频率: {freq:.3f} MHz",
+                    f"采样块: {chunks}",
+                    f"最后信号强度: {last_rssi:.1f} dBm",
+                    f"高置信度解码行数: {decoded_lines}",
+                ]
+            ),
+            border_style="cyan",
+            title="Probe 结果",
+        )
+    )
 
 
 async def qso_mode(
-    server: str, freq: float, callsign: str | None = None, auto_suggest: bool = False
+    server: str,
+    freq: float,
+    callsign: str | None = None,
+    auto_suggest: bool = False,
+    password: str = "",
+    play_audio: bool = False,
+    audio_gain: float = 0.4,
 ) -> None:
     """QSO模式"""
     console.print("[green]启动QSO模式[/green]")
@@ -156,8 +1008,9 @@ async def qso_mode(
 
     # 创建状态机
     state_machine = QSOStateMachine(callsign=callsign)
-    client = KiwiSDRClient(server)
+    client = KiwiSDRClient(server, password=password, ident_user=callsign)
     decoder = MorseDecoder()
+    player: AudioPlayer | None = None
 
     try:
         # 连接服务器
@@ -171,6 +1024,13 @@ async def qso_mode(
         # 启动音频流
         await client.start_audio_stream()
 
+        if play_audio:
+            player = AudioPlayer(
+                input_rate=decoder.sample_rate,
+                gain=audio_gain,
+            )
+            player.start()
+
         console.print("[cyan]等待CW信号...[/cyan]")
         console.print("按 Ctrl+C 停止")
         console.print()
@@ -181,6 +1041,16 @@ async def qso_mode(
             if audio_data is None:
                 await asyncio.sleep(0.1)
                 continue
+            drained = client.drain_audio_chunks(max_chunks=8)
+            if drained:
+                drained.insert(0, audio_data)
+                audio_data = drained[-1]
+            else:
+                drained = [audio_data]
+
+            if player is not None:
+                for chunk in drained:
+                    player.feed(chunk)
 
             # 解码摩尔斯电码
             decoded_text, confidence = decoder.decode(audio_data)
@@ -212,6 +1082,8 @@ async def qso_mode(
     finally:
         if client:
             await client.disconnect()
+        if player is not None:
+            player.stop()
 
 
 @click.group()
@@ -225,6 +1097,116 @@ def cli() -> None:
 def version() -> None:
     """显示版本信息"""
     print_banner()
+
+
+@cli.command()
+@click.option("--callsign", "-c", default=None, help="您的呼号")
+@click.option("--email", "-e", default=None, help="您的邮箱")
+@click.option("--locator", "-l", default=None, help="您的网格定位（可选）")
+@click.option("--new-key/--no-new-key", default=True, help="生成新的本地API密钥")
+def register(
+    callsign: str | None,
+    email: str | None,
+    locator: str | None,
+    new_key: bool,
+) -> None:
+    """注册本地用户信息并写入配置文件"""
+    from echofist.config import (
+        generate_api_key_record,
+        get_config_path,
+        load_config,
+        update_config,
+    )
+
+    config = load_config()
+
+    resolved_callsign = (
+        callsign
+        or click.prompt(
+            "呼号",
+            default=config.qso.default_callsign or "",
+        ).strip()
+    )
+    resolved_email = (
+        email
+        or click.prompt(
+            "邮箱",
+            default=config.qso.operator_email or "",
+        ).strip()
+    )
+    resolved_locator = locator
+    if resolved_locator is None:
+        resolved_locator = click.prompt(
+            "网格定位（可选）",
+            default=config.qso.default_locator or "",
+            show_default=bool(config.qso.default_locator),
+        ).strip()
+
+    updates: dict[str, Any] = {
+        "qso": {
+            "default_callsign": resolved_callsign or None,
+            "operator_email": resolved_email or None,
+            "default_locator": resolved_locator or None,
+        }
+    }
+
+    api_key: str | None = None
+    if new_key:
+        api_key, salt_b64, digest_b64 = generate_api_key_record()
+        updates["security"] = {
+            "api_key_salt_b64": salt_b64,
+            "api_key_hash_b64": digest_b64,
+        }
+
+    update_config(updates)
+
+    path = get_config_path()
+    console.print(Panel(f"已写入配置文件：{path}", border_style="green"))
+    if api_key:
+        console.print(
+            Panel(
+                f"本地API密钥（仅显示一次）：\n{api_key}",
+                border_style="yellow",
+            )
+        )
+
+
+@cli.command()
+@click.option("--server", "-s", required=True, help="KiwiSDR服务器地址")
+@click.option("--freq", "-f", type=float, default=7.023, help="频率 (MHz)")
+@click.option("--bandwidth", "-b", type=int, default=500, help="带宽 (Hz)")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["am", "cw", "usb", "lsb"]),
+    default="cw",
+    help="接收模式",
+)
+@click.option("--password", "-p", default="", help="服务器密码（如有）")
+@click.option("--user", "-u", default=None, help="显示在服务器上的用户标识")
+@click.option("--seconds", "-t", type=float, default=8.0, help="探测时长（秒）")
+def probe(
+    server: str,
+    freq: float,
+    bandwidth: int,
+    mode: str,
+    password: str,
+    user: str | None,
+    seconds: float,
+) -> None:
+    """快速探测：连接并打印音频接收/信号强度（不进入TUI）"""
+    print_banner()
+    asyncio.run(
+        probe_mode(
+            server=server,
+            freq=freq,
+            bandwidth=bandwidth,
+            mode=mode,
+            password=password,
+            ident_user=user,
+            seconds=seconds,
+        )
+    )
 
 
 @cli.command()
@@ -256,9 +1238,36 @@ def servers(list: bool) -> None:
 
 
 @cli.command()
-@click.option("--server", "-s", required=True, help="KiwiSDR服务器地址")
-@click.option("--freq", "-f", type=float, default=7.023, help="频率 (MHz)")
+@click.option(
+    "--server",
+    "-s",
+    multiple=True,
+    default=(),
+    help="KiwiSDR服务器地址（可重复多次，按顺序作为候选）",
+)
+@click.option(
+    "--band",
+    type=click.Choice(["40m", "20m", "17m", "15m", "12m", "10m"]),
+    default=None,
+    help="频段预设",
+)
+@click.option("--freq", "-f", type=float, default=None, help="频率 (MHz)")
 @click.option("--bandwidth", "-b", type=int, default=500, help="带宽 (Hz)")
+@click.option("--password", "-p", default="", help="服务器密码（如有）")
+@click.option("--user", "-u", default=None, help="显示在服务器上的用户标识")
+@click.option("--play-audio", is_flag=True, help="播放接收到的音频到默认输出设备")
+@click.option("--audio-gain", type=float, default=0.4, help="播放音量增益 (0-2)")
+@click.option("--wizard/--no-wizard", default=True, help="启动前使用交互式参数向导")
+@click.option(
+    "--with-default-servers/--no-default-servers",
+    default=True,
+    help="是否附加内置候选服务器列表作为自动切换的后备",
+)
+@click.option(
+    "--auto-switch/--no-auto-switch",
+    default=True,
+    help="断流时是否自动切换到下一个候选服务器",
+)
 @click.option(
     "--mode",
     "-m",
@@ -266,21 +1275,111 @@ def servers(list: bool) -> None:
     default="cw",
     help="接收模式",
 )
-def monitor(server: str, freq: float, bandwidth: int, mode: str) -> None:
+def monitor(
+    server: tuple[str, ...],
+    band: str | None,
+    freq: float | None,
+    bandwidth: int,
+    password: str,
+    user: str | None,
+    play_audio: bool,
+    audio_gain: float,
+    with_default_servers: bool,
+    auto_switch: bool,
+    wizard: bool,
+    mode: str,
+) -> None:
     """监听模式 - 实时解码CW信号"""
     print_banner()
-    asyncio.run(monitor_mode(server, freq, bandwidth, mode))
+    resolved_servers = server
+    resolved_band = band
+    resolved_freq: float | None = freq
+    use_wizard = wizard and sys.stdin.isatty() and sys.stdout.isatty()
+
+    if use_wizard:
+        while True:
+            resolved_servers, resolved_band, resolved_freq = _prompt_monitor_wizard(
+                servers=resolved_servers,
+                band=resolved_band,
+                freq=resolved_freq,
+                with_default_servers=with_default_servers,
+            )
+            action = asyncio.run(
+                monitor_mode(
+                    resolved_servers,
+                    float(resolved_freq),
+                    bandwidth,
+                    mode,
+                    password,
+                    user,
+                    play_audio,
+                    audio_gain,
+                    with_default_servers=with_default_servers,
+                    auto_switch=auto_switch,
+                    interactive=True,
+                )
+            )
+            if action == "restart":
+                resolved_servers = ()
+                resolved_band = None
+                resolved_freq = None
+                continue
+            break
+    else:
+        if not resolved_servers:
+            raise click.ClickException("缺少 --server/-s，或启用 --wizard 交互选择")
+        if resolved_freq is None:
+            presets = _band_presets()
+            if resolved_band and resolved_band in presets:
+                resolved_freq = presets[resolved_band][0][1]
+            else:
+                raise click.ClickException("缺少 --freq/-f，或启用 --wizard 交互选择")
+        asyncio.run(
+            monitor_mode(
+                resolved_servers,
+                float(resolved_freq),
+                bandwidth,
+                mode,
+                password,
+                user,
+                play_audio,
+                audio_gain,
+                with_default_servers=with_default_servers,
+                auto_switch=auto_switch,
+            )
+        )
 
 
 @cli.command()
 @click.option("--server", "-s", required=True, help="KiwiSDR服务器地址")
 @click.option("--freq", "-f", type=float, default=7.023, help="频率 (MHz)")
 @click.option("--callsign", "-c", help="您的呼号")
+@click.option("--password", "-p", default="", help="服务器密码（如有）")
+@click.option("--play-audio", is_flag=True, help="播放接收到的音频到默认输出设备")
+@click.option("--audio-gain", type=float, default=0.4, help="播放音量增益 (0-2)")
 @click.option("--auto-suggest", "-a", is_flag=True, help="自动提供应答建议")
-def qso(server: str, freq: float, callsign: str | None, auto_suggest: bool) -> None:
+def qso(
+    server: str,
+    freq: float,
+    callsign: str | None,
+    password: str,
+    play_audio: bool,
+    audio_gain: float,
+    auto_suggest: bool,
+) -> None:
     """QSO模式 - 半自动通联"""
     print_banner()
-    asyncio.run(qso_mode(server, freq, callsign, auto_suggest))
+    asyncio.run(
+        qso_mode(
+            server,
+            freq,
+            callsign,
+            auto_suggest,
+            password,
+            play_audio,
+            audio_gain,
+        )
+    )
 
 
 @cli.command()

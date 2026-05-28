@@ -4,6 +4,10 @@
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from loguru import Logger
 
 from loguru import logger
 
@@ -13,7 +17,7 @@ def setup_logger(
     log_file: str | None = None,
     rotation: str = "10 MB",
     retention: str = "30 days",
-) -> logger:
+) -> "Logger":
     """
     配置日志系统
 
@@ -107,31 +111,31 @@ class LogContext:
         self.component = component
         self.logger = logger.bind(component=component)
 
-    def debug(self, message: str, **kwargs) -> None:
+    def debug(self, message: str, **kwargs: Any) -> None:
         """记录调试信息"""
         self.logger.debug(message, **kwargs)
 
-    def info(self, message: str, **kwargs) -> None:
+    def info(self, message: str, **kwargs: Any) -> None:
         """记录普通信息"""
         self.logger.info(message, **kwargs)
 
-    def warning(self, message: str, **kwargs) -> None:
+    def warning(self, message: str, **kwargs: Any) -> None:
         """记录警告信息"""
         self.logger.warning(message, **kwargs)
 
-    def error(self, message: str, **kwargs) -> None:
+    def error(self, message: str, **kwargs: Any) -> None:
         """记录错误信息"""
         self.logger.error(message, **kwargs)
 
-    def exception(self, message: str, **kwargs) -> None:
+    def exception(self, message: str, **kwargs: Any) -> None:
         """记录异常信息"""
         self.logger.exception(message, **kwargs)
 
-    def success(self, message: str, **kwargs) -> None:
+    def success(self, message: str, **kwargs: Any) -> None:
         """记录成功信息"""
         self.logger.log("SUCCESS", message, **kwargs)
 
-    def with_fields(self, **kwargs):
+    def with_fields(self, **kwargs: Any) -> "Logger":
         """创建带有额外字段的logger"""
         return self.logger.bind(**kwargs)
 
@@ -161,4 +165,8 @@ info = _default_logger.info
 warning = _default_logger.warning
 error = _default_logger.error
 exception = _default_logger.exception
-success = lambda msg, **kwargs: _default_logger.log("SUCCESS", msg, **kwargs)
+
+
+def success(msg: str, **kwargs: Any) -> None:
+    """记录成功日志"""
+    _default_logger.log("SUCCESS", msg, **kwargs)

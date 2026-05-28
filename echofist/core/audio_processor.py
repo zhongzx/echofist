@@ -3,7 +3,6 @@
 用于音频信号的处理和增强
 """
 
-
 import numpy as np
 
 
@@ -115,7 +114,10 @@ class AudioProcessor:
         return audio_data * gain
 
     def detect_silence(
-        self, audio_data: np.ndarray, threshold: float = 0.01, min_duration: float = 0.1
+        self,
+        audio_data: np.ndarray,
+        threshold: float = 0.01,
+        min_duration: float = 0.1,
     ) -> np.ndarray:
         """
         检测静音段
@@ -142,7 +144,7 @@ class AudioProcessor:
         # 创建静音掩码
         silence_mask = np.zeros(len(audio_data), dtype=bool)
 
-        for start, end in zip(starts, ends):
+        for start, end in zip(starts, ends, strict=True):
             duration = (end - start) / self.sample_rate
             if duration >= min_duration:
                 silence_mask[start:end] = True
@@ -181,7 +183,7 @@ class AudioProcessor:
 
         segments = []
 
-        for start, end in zip(starts, ends):
+        for start, end in zip(starts, ends, strict=True):
             duration = (end - start) / self.sample_rate
             if duration >= min_segment:
                 segments.append(audio_data[start:end])

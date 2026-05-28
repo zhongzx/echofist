@@ -27,8 +27,19 @@ class DashboardState:
     confidence: float = 0.0
     signal_strength: float = 0.0
     is_connected: bool = False
+    connection_state: str | None = None
     last_update: float = 0.0
     error_message: str | None = None
+    server: str = ""
+    reconnect_count: int = 0
+    server_switch_count: int = 0
+    audio_chunks_total: int = 0
+    audio_chunks_rate: float = 0.0
+    audio_queue_size: int = 0
+    audio_rms: float = 0.0
+    audio_last_age: float = 0.0
+    playback_buffer_ms: float = 0.0
+    play_audio_enabled: bool = False
 
 
 class Dashboard:
@@ -93,9 +104,9 @@ class Dashboard:
         center = self.waterfall_width // 2
         spread = int(self.waterfall_width * 0.1 * signal_level)
 
-        for i in range(
-            max(0, center - spread), min(self.waterfall_width, center + spread + 1)
-        ):
+        start = max(0, center - spread)
+        end = min(self.waterfall_width, center + spread + 1)
+        for i in range(start, end):
             # 高斯分布
             distance = abs(i - center) / (spread + 1)
             intensity = signal_level * (1.0 - distance)
@@ -110,7 +121,7 @@ class Dashboard:
 
         # 将新行添加到顶部，移除最旧的行
         self.waterfall_data.insert(0, new_row)
-        if len(self.waterflow_data) > self.waterfall_height:
+        if len(self.waterfall_data) > self.waterfall_height:
             self.waterfall_data.pop()
 
     def render_header(self) -> Panel:
@@ -123,7 +134,11 @@ class Dashboard:
         header_text.append(" | ", style="dim")
 
         # 连接状态
-        if self.state.is_connected:
+        state_text = self.state.connection_state
+        if state_text:
+            header_text.append("◐ ", style="bold yellow")
+            header_text.append(state_text, style="yellow")
+        elif self.state.is_connected:
             header_text.append("● ", style="bold green")
             header_text.append("已连接", style="green")
         else:
@@ -133,7 +148,8 @@ class Dashboard:
         header_text.append(" | ", style="dim")
 
         # 频率和模式
-        header_text.append(f"{self.state.frequency:.3f} MHz", style="bold yellow")
+        freq_text = f"{self.state.frequency:.3f} MHz"
+        header_text.append(freq_text, style="bold yellow")
         header_text.append(" | ", style="dim")
         header_text.append(f"{self.state.mode.upper()}", style="bold magenta")
         header_text.append(f" BW:{self.state.bandwidth}Hz", style="dim")
@@ -216,6 +232,12 @@ class Dashboard:
         """渲染状态信息"""
         status_table = Table(show_header=False, box=None)
 
+        if self.state.server:
+            status_table.add_row("服务器:", self.state.server)
+
+        if self.state.error_message:
+            status_table.add_row("提示:", self.state.error_message)
+
         # 信号强度
         if self.config.show_signal_strength:
             signal_bar = self._create_signal_bar(self.state.signal_strength)
@@ -225,6 +247,42 @@ class Dashboard:
         if self.config.show_confidence:
             confidence_bar = self._create_confidence_bar(self.state.confidence)
             status_table.add_row("置信度:", confidence_bar)
+
+        status_table.add_row(
+            "音频块:",
+            f"{self.state.audio_chunks_total} "
+            f"({self.state.audio_chunks_rate:.1f}/s)",
+        )
+        status_table.add_row(
+            "音频队列:",
+            f"{self.state.audio_queue_size}",
+        )
+        if not self.state.play_audio_enabled:
+            status_table.add_row("播放:", "关闭（加 --play-audio）")
+        status_table.add_row(
+            "播放缓冲:",
+            f"{self.state.playback_buffer_ms:.0f}ms",
+        )
+        status_table.add_row(
+            "音频RMS:",
+            f"{self.state.audio_rms:.3f}",
+        )
+        status_table.add_row(
+            "音频年龄:",
+            f"{self.state.audio_last_age:.2f}s",
+        )
+        status_table.add_row(
+            "重连次数:",
+            f"{self.state.reconnect_count}",
+        )
+        status_table.add_row(
+            "切换次数:",
+            f"{self.state.server_switch_count}",
+        )
+        status_table.add_row(
+            "快捷键:",
+            "q 退出 | b 返回设置",
+        )
 
         # 最后更新时间
         if self.state.last_update > 0:
@@ -240,8 +298,16 @@ class Dashboard:
         """创建信号强度条"""
         bar_text = Text()
 
-        # 归一化到0-1
-        normalized = min(1.0, strength / 100.0)
+        import math
+
+        if math.isnan(strength):
+            for _ in range(10):
+                bar_text.append("░", style="dim")
+            bar_text.append(" N/A", style="dim")
+            return bar_text
+
+        normalized = (strength + 130.0) / 100.0
+        normalized = max(0.0, min(1.0, normalized))
         bars = int(normalized * 10)
 
         # 根据强度选择颜色
@@ -253,14 +319,14 @@ class Dashboard:
             color = "red"
 
         # 添加实心条
-        for i in range(bars):
+        for _ in range(bars):
             bar_text.append("█", style=f"bold {color}")
 
         # 添加空心条
-        for i in range(10 - bars):
+        for _ in range(10 - bars):
             bar_text.append("░", style="dim")
 
-        bar_text.append(f" {strength:.1f}dB", style="dim")
+        bar_text.append(f" {strength:.1f} dBm", style="dim")
 
         return bar_text
 
@@ -279,11 +345,11 @@ class Dashboard:
             color = "red"
 
         # 添加实心条
-        for i in range(bars):
+        for _ in range(bars):
             bar_text.append("█", style=f"bold {color}")
 
         # 添加空心条
-        for i in range(10 - bars):
+        for _ in range(10 - bars):
             bar_text.append("░", style="dim")
 
         bar_text.append(f" {confidence:.2f}", style="dim")
