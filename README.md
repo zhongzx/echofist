@@ -1,95 +1,91 @@
-# EchoFist (回声手迹)
+# EchoFist
 
-面向业余无线电（HAM）爱好者的跨平台 AI 辅助等幅电报（CW）通讯软件。
+<div align="center">
 
-## 🎯 项目理念
+**Cross-platform AI-assisted CW communication software for amateur radio**
 
-**极客精神，文本为王** - 抛弃华丽的图形界面，回归极客本质，专注于功能与性能。
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-## ✨ 核心特性
+</div>
 
-- **高鲁棒性盲解调**：在高噪声和信号衰落环境下实现准确的"滴哒"检出率
-- **共享电台接入**：通过 KiwiSDR 网络接入全球 700+ 远程接收机
-- **手法特征提取**：捕捉并记录对方发报的时序特征（手迹画像）
-- **自动化 QSO 流程**：减少人工抄收负担，通过标准化规则完成通联
-- **拟人化重放**：生成的 CW 信号带有特定的人格化/手法扰动
+## 📚 Documentation Languages / 文档语言 / ドキュメント言語
 
-## 🚀 快速开始
+Please select your preferred language:
 
-### 安装依赖
+- **[English](README_en.md)** - Full documentation in English
+- **[中文](README_zh.md)** - 中文完整文档
+- **[日本語](README_ja.md)** - 日本語完全ドキュメント
+
+## 🎯 Project Overview
+
+EchoFist is an AI-assisted Continuous Wave (CW) communication software designed for amateur radio enthusiasts. It combines traditional radio communication with modern AI techniques to enhance the CW experience.
+
+### Key Features:
+- **Blind Demodulation**: Robust signal detection in noisy environments
+- **KiwiSDR Integration**: Access to global remote receivers
+- **Fist Signature Analysis**: Capture and analyze operator timing characteristics
+- **Automated QSO**: Streamlined communication process
+- **Cross-Platform**: Works on Linux, macOS, and Windows
+
+## 🚀 Quick Start
+
 ```bash
-# 创建虚拟环境
+# Clone the repository
+git clone https://github.com/yourusername/echofist.git
+cd echofist
+
+# Create virtual environment
 python -m venv venv
 
-# 激活虚拟环境
+# Activate virtual environment
 # Linux/macOS
 source venv/bin/activate
 # Windows
 venv\Scripts\activate
 
-# 安装依赖
+# Install dependencies
 pip install -r requirements.txt
-```
 
-### 启动应用
-```bash
-# 基本监听模式
-python -m echofist listen --server kiwi.remotehams.com:8073
-
-# 自动通联模式
-python -m echofist auto --freq 7.025 --wpm 20
-
-# 查看帮助
+# Run the application
 python -m echofist --help
 ```
 
-## 📁 项目结构
+## 🔧 Technology Stack
 
-```
-echofist/
-├── echofist/              # 主包目录
-│   ├── core/             # 核心模块
-│   ├── ai/               # AI/ML模块
-│   ├── ui/               # 文本界面
-│   ├── data/             # 数据管理
-│   └── utils/            # 工具函数
-├── tests/                # 测试目录
-├── scripts/              # 工具脚本
-├── data/                 # 数据文件
-├── docs/                 # 文档
-└── examples/             # 示例代码
-```
+- **Audio Processing**: numpy, scipy, librosa, sounddevice
+- **Text Interface**: rich, click
+- **Network Communication**: websockets, aiohttp
+- **Data Storage**: sqlalchemy, sqlite3
+- **Machine Learning**: torch, scikit-learn (optional)
 
-## 🔧 技术栈
+## 📊 Operation Modes
 
-- **音频处理**：numpy, scipy, librosa, sounddevice
-- **文本界面**：rich, click, prompt-toolkit
-- **网络通信**：websockets, aiohttp, requests
-- **数据存储**：sqlalchemy, sqlite3, pandas
-- **机器学习**：torch, scikit-learn, onnxruntime
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Listening** | Real-time decoding, no auto-response | Learning, monitoring |
+| **Semi-Auto** | Auto-decode, manual send confirmation | Regular QSO |
+| **Full Auto** | Fully automated QSO process | Contests, unattended |
 
-## 📊 操作模式
+## 🤝 Contributing
 
-| 模式 | 描述 | 适用场景 |
-|------|------|----------|
-| **监听模式** | 实时解码显示，不自动应答 | 日常扫频、学习 |
-| **半自动模式** | 自动解码，手动确认发送 | 常规通联 |
-| **全自动模式** | 完全自动化的 QSO 流程 | 比赛、无人值守 |
+Contributions are welcome! Please read our contributing guidelines in the language-specific documentation.
 
-## 🤝 贡献指南
+## 📄 License
 
-1. Fork 项目
-2. 创建功能分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 📄 许可证
+## 🙏 Acknowledgments
 
-MIT License - 详见 [LICENSE](LICENSE) 文件
+- KiwiSDR community for global receiver network
+- Open-source audio processing libraries
+- Amateur radio community innovation
 
-## 🙏 致谢
+---
 
-- KiwiSDR 社区提供的全球接收机网络
-- 所有开源音频处理库的贡献者
-- 业余无线电社区的持续创新精神
+<div align="center">
+
+**Choose your language above to continue reading detailed documentation**
+
+</div>
