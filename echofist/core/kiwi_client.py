@@ -43,6 +43,12 @@ class KiwiReachabilityResult:
     error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class KiwiClientEvent:
+    name: str
+    ts: float
+
+
 _SND_FLAG_STEREO: Final[int] = 0x08
 _SND_FLAG_COMPRESSED: Final[int] = 0x10
 
@@ -360,6 +366,7 @@ class KiwiSDRClient:
         self._high_cut_hz: int = 800
         self._decoder = _ImaAdpcmDecoder()
         self._audio_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=8)
+        self._event_queue: asyncio.Queue[KiwiClientEvent] = asyncio.Queue(maxsize=32)
         self._ready_event: asyncio.Event = asyncio.Event()
         self._reader_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
@@ -367,6 +374,21 @@ class KiwiSDRClient:
         self._last_rx_monotonic: float = time.monotonic()
         self._last_snd_monotonic: float = time.monotonic()
         self.signal_strength: float = float("nan")
+
+    def _emit_event(self, name: str) -> None:
+        try:
+            self._event_queue.put_nowait(KiwiClientEvent(name=name, ts=time.time()))
+        except asyncio.QueueFull:
+            pass
+
+    def drain_events(self, max_events: int = 64) -> list[KiwiClientEvent]:
+        items: list[KiwiClientEvent] = []
+        for _ in range(int(max_events)):
+            try:
+                items.append(self._event_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return items
 
     async def connect(self) -> None:
         """连接到 KiwiSDR 服务器"""
@@ -408,20 +430,42 @@ class KiwiSDRClient:
 
     async def disconnect(self) -> None:
         """断开连接"""
+        self._emit_event("disconnecting")
+        self.logger.info("disconnecting")
         self.connected = False
+        pending: list[asyncio.Task[None]] = []
         if self._keepalive_task:
-            self._keepalive_task.cancel()
+            pending.append(self._keepalive_task)
             self._keepalive_task = None
         if self._reader_task:
-            self._reader_task.cancel()
+            pending.append(self._reader_task)
             self._reader_task = None
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=0.5,
+                )
+            except asyncio.TimeoutError:
+                pass
         if self.ws:
             try:
-                await self.ws.close()
+                await asyncio.wait_for(self.ws.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                transport = getattr(self.ws, "transport", None)
+                if transport is not None:
+                    try:
+                        transport.close()
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger.error(f"断开连接时出错: {e}")
             finally:
                 self.ws = None
+        self._emit_event("disconnected")
+        self.logger.info("disconnected")
 
     async def set_frequency(self, freq: float) -> None:
         """设置频率 (MHz)"""
