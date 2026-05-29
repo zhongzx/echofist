@@ -122,6 +122,9 @@ class KiwiScanHistoryRow:
     http_ok: bool | None
     http_ms: float | None
     kiwi_ts: int | None
+    status_ok: bool | None
+    users: int | None
+    users_max: int | None
     total_ms: float | None
     error_kind: str | None
     run_id: str | None
@@ -137,6 +140,23 @@ class KiwiBlockedSourceRow:
     expires_ts: int | None
     hits: int
     reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class KiwiScanDailyRow:
+    day: str
+    server: str
+    scans: int
+    tcp_ok: int
+    tcp_fail: int
+    ok_latency_sum_ms: float
+    ok_latency_n: int
+    status_samples: int
+    status_samples_trusted: int
+    full_trusted: int
+    users_sum_trusted: int
+    users_max_sum_trusted: int
+    updated_ts: int
 
 
 def default_registry_path() -> Path:
@@ -234,6 +254,9 @@ class KiwiSourceRegistry:
               http_ok INTEGER,
               http_ms REAL,
               kiwi_ts INTEGER,
+              status_ok INTEGER,
+              users INTEGER,
+              users_max INTEGER,
               total_ms REAL,
               error_kind TEXT,
               error TEXT
@@ -275,6 +298,26 @@ class KiwiSourceRegistry:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS scan_daily (
+              day TEXT NOT NULL,
+              server TEXT NOT NULL,
+              scans INTEGER NOT NULL,
+              tcp_ok INTEGER NOT NULL,
+              tcp_fail INTEGER NOT NULL,
+              ok_latency_sum_ms REAL NOT NULL,
+              ok_latency_n INTEGER NOT NULL,
+              status_samples INTEGER NOT NULL,
+              status_samples_trusted INTEGER NOT NULL,
+              full_trusted INTEGER NOT NULL,
+              users_sum_trusted INTEGER NOT NULL,
+              users_max_sum_trusted INTEGER NOT NULL,
+              updated_ts INTEGER NOT NULL,
+              PRIMARY KEY(day, server)
+            )
+            """
+        )
+        cur.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_history_server_ts
             ON scan_history(server, ts)
             """
@@ -295,6 +338,18 @@ class KiwiSourceRegistry:
             """
             CREATE INDEX IF NOT EXISTS idx_probe_budget_updated_ts
             ON probe_budget_day(updated_ts)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scan_daily_day
+            ON scan_daily(day)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scan_daily_server_day
+            ON scan_daily(server, day)
             """
         )
         cur.execute(
@@ -350,6 +405,9 @@ class KiwiSourceRegistry:
             ("http_ms", "http_ms REAL"),
             ("total_ms", "total_ms REAL"),
             ("error_kind", "error_kind TEXT"),
+            ("status_ok", "status_ok INTEGER"),
+            ("users", "users INTEGER"),
+            ("users_max", "users_max INTEGER"),
         ]
         for name, ddl in additions:
             if name in existing:
@@ -628,6 +686,195 @@ class KiwiSourceRegistry:
             (text, int(cutoff)),
         ).fetchone()
         return int(row["n"]) if row is not None and row["n"] is not None else 0
+
+    def rollup_scan_daily(
+        self,
+        *,
+        lookback_days: int = 120,
+        max_trusted_users_max: int = 8,
+    ) -> int:
+        now_ts = _now_ts()
+        days = max(1, int(lookback_days))
+        cutoff_ts = int(now_ts) - days * 86400
+        max_trusted = max(1, int(max_trusted_users_max))
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT
+              date(ts, 'unixepoch') AS day,
+              server AS server,
+              COUNT(1) AS scans,
+              SUM(CASE WHEN tcp_ok=1 THEN 1 ELSE 0 END) AS tcp_ok,
+              SUM(CASE WHEN tcp_ok=0 THEN 1 ELSE 0 END) AS tcp_fail,
+              SUM(
+                CASE
+                  WHEN tcp_ok=1 AND latency_ms IS NOT NULL THEN latency_ms
+                  ELSE 0
+                END
+              ) AS ok_latency_sum_ms,
+              SUM(
+                CASE
+                  WHEN tcp_ok=1 AND latency_ms IS NOT NULL THEN 1
+                  ELSE 0
+                END
+              ) AS ok_latency_n,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL AND users_max IS NOT NULL THEN 1
+                  ELSE 0
+                END
+              ) AS status_samples,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                  THEN 1
+                  ELSE 0
+                END
+              ) AS status_samples_trusted,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                    AND users >= users_max
+                  THEN 1
+                  ELSE 0
+                END
+              ) AS full_trusted,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                  THEN users
+                  ELSE 0
+                END
+              ) AS users_sum_trusted,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                  THEN users_max
+                  ELSE 0
+                END
+              ) AS users_max_sum_trusted
+            FROM scan_history
+            WHERE ts >= ?
+            GROUP BY day, server
+            """,
+            (max_trusted, max_trusted, max_trusted, max_trusted, cutoff_ts),
+        ).fetchall()
+        if not rows:
+            return 0
+
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO scan_daily(
+                  day,
+                  server,
+                  scans,
+                  tcp_ok,
+                  tcp_fail,
+                  ok_latency_sum_ms,
+                  ok_latency_n,
+                  status_samples,
+                  status_samples_trusted,
+                  full_trusted,
+                  users_sum_trusted,
+                  users_max_sum_trusted,
+                  updated_ts
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day, server) DO UPDATE SET
+                  scans=excluded.scans,
+                  tcp_ok=excluded.tcp_ok,
+                  tcp_fail=excluded.tcp_fail,
+                  ok_latency_sum_ms=excluded.ok_latency_sum_ms,
+                  ok_latency_n=excluded.ok_latency_n,
+                  status_samples=excluded.status_samples,
+                  status_samples_trusted=excluded.status_samples_trusted,
+                  full_trusted=excluded.full_trusted,
+                  users_sum_trusted=excluded.users_sum_trusted,
+                  users_max_sum_trusted=excluded.users_max_sum_trusted,
+                  updated_ts=excluded.updated_ts
+                """,
+                (
+                    str(r["day"]),
+                    str(r["server"]),
+                    int(r["scans"] or 0),
+                    int(r["tcp_ok"] or 0),
+                    int(r["tcp_fail"] or 0),
+                    float(r["ok_latency_sum_ms"] or 0.0),
+                    int(r["ok_latency_n"] or 0),
+                    int(r["status_samples"] or 0),
+                    int(r["status_samples_trusted"] or 0),
+                    int(r["full_trusted"] or 0),
+                    int(r["users_sum_trusted"] or 0),
+                    int(r["users_max_sum_trusted"] or 0),
+                    int(now_ts),
+                ),
+            )
+        self._conn.commit()
+        return int(len(rows))
+
+    def list_scan_daily(
+        self,
+        server: str,
+        *,
+        limit: int = 60,
+    ) -> list[KiwiScanDailyRow]:
+        text = str(server).strip()
+        if not text:
+            return []
+        lim = max(1, int(limit))
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT
+              day,
+              server,
+              scans,
+              tcp_ok,
+              tcp_fail,
+              ok_latency_sum_ms,
+              ok_latency_n,
+              status_samples,
+              status_samples_trusted,
+              full_trusted,
+              users_sum_trusted,
+              users_max_sum_trusted,
+              updated_ts
+            FROM scan_daily
+            WHERE server=?
+            ORDER BY day DESC
+            LIMIT ?
+            """,
+            (text, lim),
+        ).fetchall()
+        out: list[KiwiScanDailyRow] = []
+        for r in rows:
+            out.append(
+                KiwiScanDailyRow(
+                    day=str(r["day"]),
+                    server=str(r["server"]),
+                    scans=int(r["scans"]),
+                    tcp_ok=int(r["tcp_ok"]),
+                    tcp_fail=int(r["tcp_fail"]),
+                    ok_latency_sum_ms=float(r["ok_latency_sum_ms"] or 0.0),
+                    ok_latency_n=int(r["ok_latency_n"] or 0),
+                    status_samples=int(r["status_samples"] or 0),
+                    status_samples_trusted=int(r["status_samples_trusted"] or 0),
+                    full_trusted=int(r["full_trusted"] or 0),
+                    users_sum_trusted=int(r["users_sum_trusted"] or 0),
+                    users_max_sum_trusted=int(r["users_max_sum_trusted"] or 0),
+                    updated_ts=int(r["updated_ts"]),
+                )
+            )
+        return out
 
     def get_last_seen_ts(self, server: str) -> int | None:
         text = str(server).strip()
@@ -919,11 +1166,14 @@ class KiwiSourceRegistry:
               http_ok,
               http_ms,
               kiwi_ts,
+              status_ok,
+              users,
+              users_max,
               total_ms,
               error_kind,
               error
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(run_id) if run_id else None,
@@ -936,6 +1186,9 @@ class KiwiSourceRegistry:
                 1 if result.http_ok else 0 if result.http_ok is False else None,
                 result.http_ms,
                 result.kiwi_ts,
+                1 if result.status_ok else 0 if result.status_ok is False else None,
+                result.users,
+                result.users_max,
                 result.total_ms,
                 result.error_kind,
                 result.error,
@@ -1079,11 +1332,14 @@ class KiwiSourceRegistry:
                   http_ok,
                   http_ms,
                   kiwi_ts,
+                  status_ok,
+                  users,
+                  users_max,
                   total_ms,
                   error_kind,
                   error
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id) if run_id else None,
@@ -1096,6 +1352,9 @@ class KiwiSourceRegistry:
                     1 if r.http_ok else 0 if r.http_ok is False else None,
                     r.http_ms,
                     r.kiwi_ts,
+                    1 if r.status_ok else 0 if r.status_ok is False else None,
+                    r.users,
+                    r.users_max,
                     r.total_ms,
                     r.error_kind,
                     r.error,
@@ -1352,6 +1611,9 @@ class KiwiSourceRegistry:
               http_ok,
               http_ms,
               kiwi_ts,
+              status_ok,
+              users,
+              users_max,
               total_ms,
               error_kind,
               run_id,
@@ -1381,6 +1643,15 @@ class KiwiSourceRegistry:
                     ),
                     http_ms=float(r["http_ms"]) if r["http_ms"] is not None else None,
                     kiwi_ts=int(r["kiwi_ts"]) if r["kiwi_ts"] is not None else None,
+                    status_ok=(
+                        bool(int(r["status_ok"]))
+                        if r["status_ok"] is not None
+                        else None
+                    ),
+                    users=int(r["users"]) if r["users"] is not None else None,
+                    users_max=(
+                        int(r["users_max"]) if r["users_max"] is not None else None
+                    ),
                     total_ms=(
                         float(r["total_ms"]) if r["total_ms"] is not None else None
                     ),

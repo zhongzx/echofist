@@ -302,3 +302,107 @@ def test_pick_best_ignores_untrusted_users_max(tmp_path: Path, monkeypatch) -> N
         assert "trusted.example.com:8073" not in servers
     finally:
         service.close()
+
+
+def test_rollup_scan_daily_trusted_users_max(tmp_path: Path, monkeypatch) -> None:
+    ts_day1 = 1_700_000_000
+    ts_day2 = ts_day1 + 86400
+    db_path = tmp_path / "kiwi.sqlite3"
+    registry = KiwiSourceRegistry(path=db_path)
+    try:
+        monkeypatch.setattr(ks, "_now_ts", lambda: ts_day1)
+        day1_ok = KiwiReachabilityResult(
+            server="a.example.com:8073",
+            host="a.example.com",
+            port=8073,
+            tcp_ok=True,
+            latency_ms=100.0,
+            tcp_ms=100.0,
+            http_status=None,
+            http_ok=None,
+            http_ms=None,
+            kiwi_ts=None,
+            status_ok=True,
+            status_ms=5.0,
+            users=1,
+            users_max=4,
+            total_ms=120.0,
+            error_kind=None,
+            error=None,
+        )
+        day1_fail = KiwiReachabilityResult(
+            server="a.example.com:8073",
+            host="a.example.com",
+            port=8073,
+            tcp_ok=False,
+            latency_ms=None,
+            tcp_ms=200.0,
+            http_status=None,
+            http_ok=None,
+            http_ms=None,
+            kiwi_ts=None,
+            status_ok=None,
+            status_ms=None,
+            users=None,
+            users_max=None,
+            total_ms=210.0,
+            error_kind="timeout",
+            error="timeout",
+        )
+        registry.record_scans([day1_ok, day1_fail], max_total=1000, run_id=None)
+
+        monkeypatch.setattr(ks, "_now_ts", lambda: ts_day2)
+        day2_untrusted = KiwiReachabilityResult(
+            server="a.example.com:8073",
+            host="a.example.com",
+            port=8073,
+            tcp_ok=True,
+            latency_ms=150.0,
+            tcp_ms=150.0,
+            http_status=None,
+            http_ok=None,
+            http_ms=None,
+            kiwi_ts=None,
+            status_ok=True,
+            status_ms=5.0,
+            users=50,
+            users_max=50,
+            total_ms=180.0,
+            error_kind=None,
+            error=None,
+        )
+        registry.record_scans([day2_untrusted], max_total=1000, run_id=None)
+
+        monkeypatch.setattr(ks, "_now_ts", lambda: ts_day2)
+        n = registry.rollup_scan_daily(lookback_days=3650, max_trusted_users_max=8)
+        assert n == 2
+
+        rows = registry.list_scan_daily("a.example.com:8073", limit=10)
+        assert len(rows) == 2
+        by_day = {r.day: r for r in rows}
+
+        day1_key = time.strftime("%Y-%m-%d", time.gmtime(ts_day1))
+        day2_key = time.strftime("%Y-%m-%d", time.gmtime(ts_day2))
+        d1 = by_day[day1_key]
+        assert d1.scans == 2
+        assert d1.tcp_ok == 1
+        assert d1.tcp_fail == 1
+        assert d1.ok_latency_n == 1
+        assert d1.ok_latency_sum_ms == 100.0
+        assert d1.status_samples == 1
+        assert d1.status_samples_trusted == 1
+        assert d1.full_trusted == 0
+        assert d1.users_sum_trusted == 1
+        assert d1.users_max_sum_trusted == 4
+
+        d2 = by_day[day2_key]
+        assert d2.scans == 1
+        assert d2.tcp_ok == 1
+        assert d2.tcp_fail == 0
+        assert d2.status_samples == 1
+        assert d2.status_samples_trusted == 0
+        assert d2.full_trusted == 0
+        assert d2.users_sum_trusted == 0
+        assert d2.users_max_sum_trusted == 0
+    finally:
+        registry.close()
