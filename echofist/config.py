@@ -19,6 +19,20 @@ class KiwiSDRConfig(BaseModel):
     timeout: int = Field(30, description="连接超时时间（秒）")
     reconnect_attempts: int = Field(3, description="重连尝试次数")
     reconnect_delay: float = Field(5.0, description="重连延迟（秒）")
+    server_cooldown_seconds: float = Field(
+        120.0,
+        description="源不稳定时的冷却周期（秒）",
+    )
+
+
+class KiwiSourcePolicyConfig(BaseModel):
+    """Kiwi 源注册表策略配置"""
+
+    daily_fetch_cap: int = Field(50, description="每日/单次引入新源上限")
+    max_total: int = Field(1000, description="注册表总量上限")
+    prune_disable_consecutive_failures: int = Field(8, description="禁用连败阈值")
+    prune_disable_min_samples: int = Field(12, description="禁用最小样本数")
+    prune_disable_min_success_ratio: float = Field(0.25, description="禁用最小成功率")
 
 
 class MorseDecoderConfig(BaseModel):
@@ -65,6 +79,7 @@ class AppConfig(BaseModel):
     """应用配置"""
 
     kiwi_sdr: KiwiSDRConfig = Field(default_factory=KiwiSDRConfig)
+    kiwi_sources: KiwiSourcePolicyConfig = Field(default_factory=KiwiSourcePolicyConfig)
     morse_decoder: MorseDecoderConfig = Field(
         default_factory=MorseDecoderConfig,
     )

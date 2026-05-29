@@ -4,6 +4,7 @@ KiwiSDR 客户端模块 - 支持全球 700+ 远程接收机接入
 
 import asyncio
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -30,8 +31,142 @@ class KiwiSDRServer:
     freq_range: tuple[float, float] = (0.0, 30.0)
 
 
+@dataclass(frozen=True, slots=True)
+class KiwiReachabilityResult:
+    server: str
+    host: str
+    port: int
+    tcp_ok: bool
+    latency_ms: float | None
+    http_status: int | None
+    kiwi_ts: int | None
+    error: str | None
+
+
 _SND_FLAG_STEREO: Final[int] = 0x08
 _SND_FLAG_COMPRESSED: Final[int] = 0x10
+
+
+def parse_kiwi_server_address(server: str) -> tuple[str, int]:
+    text = server.strip()
+    if not text:
+        raise ValueError("空服务器地址")
+    if ":" in text:
+        host, port_str = text.split(":", 1)
+        port = int(port_str)
+    else:
+        host = text
+        port = 8073
+    host = host.strip()
+    if not host:
+        raise ValueError("空主机名")
+    if not (8000 <= port <= 9000):
+        raise ValueError(f"端口超出允许范围(8000-9000): {port}")
+    return host, port
+
+
+async def check_kiwi_reachability(
+    server: str,
+    *,
+    timeout_seconds: float = 1.2,
+    verify_http: bool = True,
+) -> KiwiReachabilityResult:
+    host: str
+    port: int
+    try:
+        host, port = parse_kiwi_server_address(server)
+    except Exception as e:
+        return KiwiReachabilityResult(
+            server=server,
+            host="",
+            port=0,
+            tcp_ok=False,
+            latency_ms=None,
+            http_status=None,
+            kiwi_ts=None,
+            error=str(e),
+        )
+
+    start = time.monotonic()
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=float(timeout_seconds),
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    except Exception as e:
+        return KiwiReachabilityResult(
+            server=server,
+            host=host,
+            port=port,
+            tcp_ok=False,
+            latency_ms=None,
+            http_status=None,
+            kiwi_ts=None,
+            error=str(e),
+        )
+
+    latency_ms = (time.monotonic() - start) * 1000.0
+    http_status: int | None = None
+    kiwi_ts: int | None = None
+    http_error: str | None = None
+
+    if verify_http:
+        url = f"http://{host}:{port}/VER"
+        timeout = aiohttp.ClientTimeout(total=float(timeout_seconds))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.get(url) as resp:
+                    http_status = int(resp.status)
+                    if http_status == 200:
+                        data: Any = await resp.json()
+                        ts = data.get("ts") if isinstance(data, dict) else None
+                        if isinstance(ts, int):
+                            kiwi_ts = ts
+                        elif isinstance(ts, float):
+                            kiwi_ts = int(ts)
+            except Exception as e:
+                http_error = str(e)
+
+    return KiwiReachabilityResult(
+        server=server,
+        host=host,
+        port=port,
+        tcp_ok=True,
+        latency_ms=latency_ms,
+        http_status=http_status,
+        kiwi_ts=kiwi_ts,
+        error=http_error,
+    )
+
+
+async def scan_kiwi_reachability(
+    servers: Sequence[str],
+    *,
+    concurrency: int = 5,
+    timeout_seconds: float = 1.2,
+    verify_http: bool = True,
+) -> list[KiwiReachabilityResult]:
+    limit = max(1, min(int(concurrency), 10))
+    sem = asyncio.Semaphore(limit)
+
+    async def run_one(server: str) -> KiwiReachabilityResult:
+        async with sem:
+            return await check_kiwi_reachability(
+                server,
+                timeout_seconds=timeout_seconds,
+                verify_http=verify_http,
+            )
+
+    tasks = [asyncio.create_task(run_one(s)) for s in servers]
+    if not tasks:
+        return []
+    results = await asyncio.gather(*tasks)
+    return list(results)
 
 
 class _ImaAdpcmDecoder:

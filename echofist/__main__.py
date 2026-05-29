@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import click
@@ -23,7 +24,19 @@ from rich.table import Table
 from rich.text import Text
 
 from echofist import __version__
-from echofist.core.kiwi_client import KiwiSDRClient
+from echofist.config import load_config
+from echofist.core.kiwi_client import (
+    KiwiReachabilityResult,
+    KiwiSDRClient,
+    scan_kiwi_reachability,
+)
+from echofist.core.kiwi_sources import (
+    KiwiScanHistoryRow,
+    KiwiSourceRegistry,
+    KiwiSourceSummary,
+    fetch_public_kiwi_sources,
+    parse_kiwi_public_text,
+)
 from echofist.core.morse_decoder import MorseDecoder
 from echofist.core.qso_state import QSOStateMachine
 from echofist.logger import setup_logger
@@ -511,6 +524,112 @@ def print_kiwi_servers(servers: list) -> None:
     console.print(table)
 
 
+def print_kiwi_scan_results(results: list[KiwiReachabilityResult]) -> None:
+    if not results:
+        console.print("[yellow]未提供扫描目标[/yellow]")
+        return
+
+    table = Table(title="KiwiSDR 可达性扫描", show_header=True, header_style="bold")
+    table.add_column("服务器", style="cyan", no_wrap=True)
+    table.add_column("TCP", style="green", justify="center", no_wrap=True)
+    table.add_column("延迟", style="yellow", justify="right", no_wrap=True)
+    table.add_column("/VER", style="magenta", justify="right", no_wrap=True)
+    table.add_column("TS", style="blue", justify="right", no_wrap=True)
+    table.add_column("错误", style="red")
+
+    def fmt_latency(v: float | None) -> str:
+        if v is None:
+            return "-"
+        if v >= 1000.0:
+            return f"{v/1000.0:.2f}s"
+        return f"{v:.0f}ms"
+
+    for r in sorted(
+        results,
+        key=lambda x: (0 if x.tcp_ok else 1, x.latency_ms or 10_000.0, x.server),
+    ):
+        tcp_text = "✓" if r.tcp_ok else "✗"
+        http_text = "-" if r.http_status is None else str(r.http_status)
+        ts_text = "-" if r.kiwi_ts is None else str(r.kiwi_ts)
+        err = r.error or ""
+        table.add_row(
+            r.server,
+            tcp_text,
+            fmt_latency(r.latency_ms),
+            http_text,
+            ts_text,
+            err,
+        )
+
+    console.print(table)
+
+
+def print_kiwi_registry_summaries(items: list[KiwiSourceSummary]) -> None:
+    if not items:
+        console.print("[yellow]注册表为空[/yellow]")
+        return
+
+    table = Table(title="KiwiSDR 源注册表", show_header=True, header_style="bold")
+    table.add_column("服务器", style="cyan", no_wrap=True)
+    table.add_column("启用", style="green", justify="center", no_wrap=True)
+    table.add_column("评分", style="yellow", justify="right", no_wrap=True)
+    table.add_column("成功/失败", style="magenta", justify="right", no_wrap=True)
+    table.add_column("连败", style="red", justify="right", no_wrap=True)
+    table.add_column("延迟", style="blue", justify="right", no_wrap=True)
+
+    def fmt_latency(v: float | None) -> str:
+        if v is None:
+            return "-"
+        if v >= 1000.0:
+            return f"{v/1000.0:.2f}s"
+        return f"{v:.0f}ms"
+
+    for it in items:
+        table.add_row(
+            it.server,
+            "✓" if it.enabled else "✗",
+            f"{it.score:.3f}",
+            f"{it.successes}/{it.failures}",
+            str(it.consecutive_failures),
+            fmt_latency(it.last_latency_ms),
+        )
+
+    console.print(table)
+
+
+def print_kiwi_history(rows: list[KiwiScanHistoryRow]) -> None:
+    if not rows:
+        console.print("[yellow]暂无历史记录[/yellow]")
+        return
+
+    table = Table(title="扫描历史", show_header=True, header_style="bold")
+    table.add_column("时间", style="cyan", no_wrap=True)
+    table.add_column("TCP", style="green", justify="center", no_wrap=True)
+    table.add_column("延迟", style="yellow", justify="right", no_wrap=True)
+    table.add_column("/VER", style="magenta", justify="right", no_wrap=True)
+    table.add_column("TS", style="blue", justify="right", no_wrap=True)
+    table.add_column("错误", style="red")
+
+    def fmt_latency(v: float | None) -> str:
+        if v is None:
+            return "-"
+        if v >= 1000.0:
+            return f"{v/1000.0:.2f}s"
+        return f"{v:.0f}ms"
+
+    for r in rows:
+        table.add_row(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r.ts)),
+            "✓" if r.tcp_ok else "✗",
+            fmt_latency(r.latency_ms),
+            "-" if r.http_status is None else str(r.http_status),
+            "-" if r.kiwi_ts is None else str(r.kiwi_ts),
+            r.error or "",
+        )
+
+    console.print(table)
+
+
 async def monitor_mode(
     servers: tuple[str, ...],
     freq: float,
@@ -521,6 +640,14 @@ async def monitor_mode(
     play_audio: bool = False,
     audio_gain: float = 0.4,
     *,
+    precheck: bool = False,
+    precheck_concurrency: int = 5,
+    precheck_timeout: float = 1.2,
+    precheck_verify_http: bool = True,
+    with_registry: bool = True,
+    registry_target: int = 50,
+    learn: bool = True,
+    max_store: int = 1000,
     with_default_servers: bool = True,
     auto_switch: bool = True,
     interactive: bool = False,
@@ -533,19 +660,64 @@ async def monitor_mode(
     console.print(f"模式: [magenta]{mode.upper()}[/magenta]")
     console.print()
 
+    registry: KiwiSourceRegistry | None = None
+    registry_candidates: list[str] = []
+    if (with_registry and not interactive) or (learn and precheck):
+        registry = KiwiSourceRegistry()
+    if with_registry and not interactive and registry is not None:
+        registry_candidates = registry.pick_servers(target=registry_target)
+
     default_servers = _default_server_candidates()
     server_candidates: list[str] = []
     if interactive:
         base_candidates = list(servers)
     else:
-        base_candidates = list(servers) + (
-            default_servers if with_default_servers else []
-        )
+        defaults = default_servers if with_default_servers else []
+        base_candidates = list(servers) + registry_candidates + list(defaults)
     for s in base_candidates:
         if s and s not in server_candidates:
             server_candidates.append(s)
     if not server_candidates:
         raise click.ClickException("未提供可用的 KiwiSDR 服务器")
+
+    if precheck and len(server_candidates) > 1:
+        original_candidates = list(server_candidates)
+        scan_results = await scan_kiwi_reachability(
+            server_candidates,
+            concurrency=precheck_concurrency,
+            timeout_seconds=precheck_timeout,
+            verify_http=precheck_verify_http,
+        )
+        added = 0
+        disabled = 0
+        if learn and registry is not None:
+            added, disabled = registry.record_scans(
+                scan_results,
+                max_total=max_store,
+            )
+        by_server: dict[str, KiwiReachabilityResult] = {
+            r.server: r for r in scan_results
+        }
+        reachable = [
+            s for s in server_candidates if by_server.get(s) and by_server[s].tcp_ok
+        ]
+        reachable_sorted = sorted(
+            reachable,
+            key=lambda s: (
+                by_server[s].latency_ms is None,
+                by_server[s].latency_ms or 10_000.0,
+                s,
+            ),
+        )
+        reachable_set = set(reachable)
+        unreachable = [s for s in server_candidates if s not in reachable_set]
+        server_candidates = reachable_sorted + unreachable
+        if server_candidates and original_candidates:
+            best = server_candidates[0]
+            if best != original_candidates[0]:
+                console.print(f"[dim]预检：已选最稳源 {best}[/dim]")
+        if learn and (added > 0 or disabled > 0):
+            console.print(f"[dim]预检学习：新增 {added} 淘汰 {disabled}[/dim]")
 
     server_index = 0
     current_server = server_candidates[server_index]
@@ -567,10 +739,11 @@ async def monitor_mode(
     server_fail_until: dict[str, float] = {}
 
     try:
+        app_config = load_config()
         reconnect_warn_seconds = 6.0
         reconnect_after_seconds = 20.0
         switch_after_seconds = 60.0
-        server_cooldown_seconds = 120.0
+        server_cooldown_seconds = float(app_config.kiwi_sdr.server_cooldown_seconds)
         min_switch_interval_seconds = 30.0
 
         async def connect_and_start(
@@ -749,6 +922,15 @@ async def monitor_mode(
                                 current_server = candidate
                                 server_index = idx
                                 server_switch_count += 1
+                                if registry is not None:
+                                    registry.record_monitor_event(
+                                        server=old_server,
+                                        event_type="switch",
+                                        from_server=old_server,
+                                        to_server=candidate,
+                                        detail=f"stalled={stalled_seconds:.1f}",
+                                        max_total=max_store,
+                                    )
                                 loop_now = asyncio.get_running_loop().time()
                                 window_start = loop_now
                                 window_chunks = 0
@@ -810,6 +992,13 @@ async def monitor_mode(
                             layout["status"].update(dashboard.render_status())
                             if player is not None:
                                 player.clear()
+                            if registry is not None:
+                                registry.record_monitor_event(
+                                    server=current_server,
+                                    event_type="reconnect",
+                                    detail=f"audio_age={audio_age:.1f}",
+                                    max_total=max_store,
+                                )
                             try:
                                 await client.disconnect()
                             except Exception:
@@ -933,6 +1122,8 @@ async def monitor_mode(
             await client.disconnect()
         if player is not None:
             player.stop()
+        if registry is not None:
+            registry.close()
 
 
 async def probe_mode(
@@ -1111,12 +1302,7 @@ def register(
     new_key: bool,
 ) -> None:
     """注册本地用户信息并写入配置文件"""
-    from echofist.config import (
-        generate_api_key_record,
-        get_config_path,
-        load_config,
-        update_config,
-    )
+    from echofist.config import generate_api_key_record, get_config_path, update_config
 
     config = load_config()
 
@@ -1237,6 +1423,276 @@ def servers(list: bool) -> None:
         print_kiwi_servers(example_servers)
 
 
+@cli.group()
+def sources() -> None:
+    """管理 KiwiSDR 源注册表（增量积累与淘汰）"""
+    pass
+
+
+@sources.command("fetch")
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 200),
+    default=50,
+    show_default=True,
+    help="本次最多引入的新源数量（温和增量）",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=8.0,
+    show_default=True,
+    help="拉取公共目录的超时（秒）",
+)
+@click.option(
+    "--html-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="从本地HTML文件提取（用于被反爬/验证码拦截时的离线导入）",
+)
+@click.option(
+    "--html-stdin",
+    is_flag=True,
+    help="从标准输入读取HTML并提取（用于被反爬/验证码拦截时的离线导入）",
+)
+@click.option(
+    "--max-total",
+    type=click.IntRange(50, 1000),
+    default=1000,
+    show_default=True,
+    help="注册表总量上限（超过将删除最差记录）",
+)
+def sources_fetch(
+    limit: int,
+    timeout: float,
+    html_file: str | None,
+    html_stdin: bool,
+    max_total: int,
+) -> None:
+    """从公共目录增量引入 KiwiSDR 源（去重 + 端口范围过滤）"""
+    print_banner()
+    registry = KiwiSourceRegistry()
+    try:
+        if html_stdin:
+            html = sys.stdin.read()
+            candidates = parse_kiwi_public_text(html)
+        elif html_file:
+            html = Path(html_file).read_text(encoding="utf-8", errors="ignore")
+            candidates = parse_kiwi_public_text(html)
+        else:
+            candidates = asyncio.run(fetch_public_kiwi_sources(timeout_seconds=timeout))
+        added = registry.add_sources(candidates, daily_cap=limit, max_total=max_total)
+        stats = registry.stats()
+    finally:
+        registry.close()
+    console.print(
+        Panel(
+            f"新增：{added}\n启用：{stats['enabled']}\n总量：{stats['total']}",
+            title="拉取完成",
+            border_style="green",
+        )
+    )
+    if not candidates:
+        console.print(
+            Panel(
+                "未提取到任何服务器条目。\n"
+                "可能原因：公共目录返回验证码/反爬页面，或网络环境无法直连。\n\n"
+                "可选方案：\n"
+                "1) 浏览器打开 http://kiwisdr.com/public/ 或 https://rx.kiwisdr.com/ ，"
+                "保存页面HTML后用 --html-file 导入\n"
+                "2) 将HTML内容粘贴到命令行并用 --html-stdin 导入（Ctrl-D 结束）",
+                title="提示",
+                border_style="yellow",
+            )
+        )
+
+
+@sources.command("list")
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 200),
+    default=50,
+    show_default=True,
+    help="显示数量",
+)
+@click.option(
+    "--all/--enabled-only",
+    default=False,
+    help="是否包含已淘汰/禁用源",
+)
+def sources_list(limit: int, all: bool) -> None:
+    """列出注册表中的源（按评分排序）"""
+    print_banner()
+    registry = KiwiSourceRegistry()
+    try:
+        items = registry.list_sources(limit=limit, enabled_only=not all)
+        stats = registry.stats()
+    finally:
+        registry.close()
+    console.print(
+        Panel(
+            f"启用：{stats['enabled']} / 总量：{stats['total']}",
+            title="注册表统计",
+            border_style="cyan",
+        )
+    )
+    print_kiwi_registry_summaries(items)
+
+
+@sources.command("prune")
+@click.option(
+    "--max-total",
+    type=click.IntRange(50, 1000),
+    default=1000,
+    show_default=True,
+    help="注册表总量上限",
+)
+def sources_prune(max_total: int) -> None:
+    """淘汰不稳定源并维持上限"""
+    print_banner()
+    registry = KiwiSourceRegistry()
+    try:
+        disabled = registry.prune(max_total=max_total)
+        stats = registry.stats()
+    finally:
+        registry.close()
+    console.print(
+        Panel(
+            f"本次禁用：{disabled}\n启用：{stats['enabled']}\n总量：{stats['total']}",
+            title="淘汰完成",
+            border_style="yellow",
+        )
+    )
+
+
+@sources.command("history")
+@click.option("--server", "-s", required=True, help="KiwiSDR服务器地址")
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 200),
+    default=30,
+    show_default=True,
+    help="显示条数",
+)
+def sources_history(server: str, limit: int) -> None:
+    """查看单个源的扫描历史"""
+    print_banner()
+    registry = KiwiSourceRegistry()
+    try:
+        rows = registry.list_history(server, limit=limit)
+    finally:
+        registry.close()
+    console.print(Panel(server, title="目标服务器", border_style="cyan"))
+    print_kiwi_history(rows)
+
+
+@cli.command()
+@click.option(
+    "--server",
+    "-s",
+    multiple=True,
+    default=(),
+    help="KiwiSDR服务器地址（可重复多次，按顺序作为候选）",
+)
+@click.option(
+    "--with-default-servers/--no-default-servers",
+    default=True,
+    help="是否附加内置候选服务器列表",
+)
+@click.option(
+    "--with-registry/--no-with-registry",
+    default=True,
+    help="是否附加本地注册表中的源（用于逐日积累的候选池）",
+)
+@click.option(
+    "--registry-target",
+    type=click.IntRange(1, 200),
+    default=50,
+    show_default=True,
+    help="从注册表挑选的目标数量（建议 ≥ 50）",
+)
+@click.option(
+    "--concurrency",
+    type=click.IntRange(1, 10),
+    default=5,
+    show_default=True,
+    help="并发量（推荐 5，上限 10）",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=1.2,
+    show_default=True,
+    help="单个目标超时（秒）",
+)
+@click.option(
+    "--verify-http/--no-verify-http",
+    default=True,
+    help="是否请求 /VER 以获取 KiwiSDR 时间戳信息",
+)
+@click.option(
+    "--learn/--no-learn",
+    default=True,
+    help="是否把扫描结果写入本地注册表（用于淘汰与累计）",
+)
+@click.option(
+    "--max-store",
+    type=click.IntRange(50, 1000),
+    default=1000,
+    show_default=True,
+    help="注册表总量上限",
+)
+def scan(
+    server: tuple[str, ...],
+    with_default_servers: bool,
+    with_registry: bool,
+    registry_target: int,
+    concurrency: int,
+    timeout: float,
+    verify_http: bool,
+    learn: bool,
+    max_store: int,
+) -> None:
+    """扫描 KiwiSDR 源的网络可达性（低开销：TCP 直连 + 可选 /VER）"""
+    print_banner()
+    targets: list[str] = []
+    results: list[KiwiReachabilityResult] = []
+    registry: KiwiSourceRegistry | None = None
+    try:
+        if with_registry or learn:
+            registry = KiwiSourceRegistry()
+        if with_registry and registry is not None:
+            for s in registry.pick_servers(target=registry_target):
+                if s and s not in targets:
+                    targets.append(s)
+        defaults = _default_server_candidates() if with_default_servers else []
+        for s in list(server) + defaults:
+            if s and s not in targets:
+                targets.append(s)
+
+        results = asyncio.run(
+            scan_kiwi_reachability(
+                targets,
+                concurrency=concurrency,
+                timeout_seconds=timeout,
+                verify_http=verify_http,
+            )
+        )
+        if learn and registry is not None:
+            added, disabled = registry.record_scans(results, max_total=max_store)
+            console.print(
+                Panel(
+                    f"新增：{added}\n本次禁用：{disabled}",
+                    title="学习完成",
+                    border_style="green",
+                )
+            )
+    finally:
+        if registry is not None:
+            registry.close()
+    print_kiwi_scan_results(results)
+
+
 @cli.command()
 @click.option(
     "--server",
@@ -1264,9 +1720,57 @@ def servers(list: bool) -> None:
     help="是否附加内置候选服务器列表作为自动切换的后备",
 )
 @click.option(
+    "--with-registry/--no-with-registry",
+    default=True,
+    help="是否附加本地注册表的候选源作为自动切换的后备",
+)
+@click.option(
+    "--registry-target",
+    type=click.IntRange(1, 200),
+    default=50,
+    show_default=True,
+    help="从注册表挑选的目标数量",
+)
+@click.option(
     "--auto-switch/--no-auto-switch",
     default=True,
     help="断流时是否自动切换到下一个候选服务器",
+)
+@click.option(
+    "--precheck/--no-precheck",
+    default=True,
+    help="启动时并发预检候选服务器可达性（降低逐个长超时）",
+)
+@click.option(
+    "--precheck-concurrency",
+    type=click.IntRange(1, 10),
+    default=5,
+    show_default=True,
+    help="预检并发量（推荐 5，上限 10）",
+)
+@click.option(
+    "--precheck-timeout",
+    type=float,
+    default=1.2,
+    show_default=True,
+    help="预检单个目标超时（秒）",
+)
+@click.option(
+    "--precheck-verify-http/--no-precheck-verify-http",
+    default=True,
+    help="预检时是否请求 /VER",
+)
+@click.option(
+    "--learn/--no-learn",
+    default=True,
+    help="启动预检结果是否写入本地注册表（用于增量积累与淘汰）",
+)
+@click.option(
+    "--max-store",
+    type=click.IntRange(50, 1000),
+    default=1000,
+    show_default=True,
+    help="注册表总量上限",
 )
 @click.option(
     "--mode",
@@ -1285,7 +1789,15 @@ def monitor(
     play_audio: bool,
     audio_gain: float,
     with_default_servers: bool,
+    with_registry: bool,
+    registry_target: int,
     auto_switch: bool,
+    precheck: bool,
+    precheck_concurrency: int,
+    precheck_timeout: float,
+    precheck_verify_http: bool,
+    learn: bool,
+    max_store: int,
     wizard: bool,
     mode: str,
 ) -> None:
@@ -1314,6 +1826,14 @@ def monitor(
                     user,
                     play_audio,
                     audio_gain,
+                    precheck=precheck,
+                    precheck_concurrency=precheck_concurrency,
+                    precheck_timeout=precheck_timeout,
+                    precheck_verify_http=precheck_verify_http,
+                    with_registry=with_registry,
+                    registry_target=registry_target,
+                    learn=learn,
+                    max_store=max_store,
                     with_default_servers=with_default_servers,
                     auto_switch=auto_switch,
                     interactive=True,
@@ -1344,6 +1864,14 @@ def monitor(
                 user,
                 play_audio,
                 audio_gain,
+                precheck=precheck,
+                precheck_concurrency=precheck_concurrency,
+                precheck_timeout=precheck_timeout,
+                precheck_verify_http=precheck_verify_http,
+                with_registry=with_registry,
+                registry_target=registry_target,
+                learn=learn,
+                max_store=max_store,
                 with_default_servers=with_default_servers,
                 auto_switch=auto_switch,
             )
