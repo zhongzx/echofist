@@ -56,6 +56,7 @@ try:
     from echofist.core.qso_state import QSOStateMachine
     from echofist.logger import setup_logger
     from echofist.ui.dashboard import Dashboard
+    from echofist.ui.i18n import UILocalizer, get_ui_localizer
 except ModuleNotFoundError as e:
     print(
         "EchoFist 启动失败：缺少依赖或环境未正确安装。\n"
@@ -149,15 +150,17 @@ class _KeyPoller:
 
     def _get_event_windows(
         self,
-    ) -> Literal["up", "down", "left", "right", "enter", "esc", "q", "b"] | None:
+    ) -> Literal["up", "down", "left", "right", "enter", "esc", "q", "b", "l"] | None:
         ch = self._read_char()
         if ch is None:
             return None
-        mapping: dict[str, Literal["enter", "esc", "q", "b"]] = {
+        mapping: dict[str, Literal["enter", "esc", "q", "b", "l"]] = {
             "q": "q",
             "Q": "q",
             "b": "b",
             "B": "b",
+            "l": "l",
+            "L": "l",
             "\r": "enter",
             "\x1b": "esc",
         }
@@ -208,15 +211,17 @@ class _KeyPoller:
 
     def _get_event_posix(
         self,
-    ) -> Literal["up", "down", "left", "right", "enter", "esc", "q", "b"] | None:
+    ) -> Literal["up", "down", "left", "right", "enter", "esc", "q", "b", "l"] | None:
         ch = self._read_char()
         if ch is None:
             return None
-        mapping: dict[str, Literal["enter", "q", "b"]] = {
+        mapping: dict[str, Literal["enter", "q", "b", "l"]] = {
             "q": "q",
             "Q": "q",
             "b": "b",
             "B": "b",
+            "l": "l",
+            "L": "l",
             "\n": "enter",
             "\r": "enter",
         }
@@ -240,6 +245,7 @@ class _KeyPoller:
             "esc",
             "q",
             "b",
+            "l",
         ]
         | None
     ):
@@ -266,26 +272,26 @@ def _default_server_candidates() -> list[str]:
 def _band_presets() -> dict[str, list[tuple[str, float]]]:
     return {
         "40m": [
-            ("7.030 QRP Calling", 7.030),
-            ("7.023 常用", 7.023),
+            ("qrp_calling", 7.030),
+            ("common", 7.023),
         ],
         "20m": [
-            ("14.060 QRP Calling", 14.060),
-            ("14.100 NCDXF 信标", 14.100),
+            ("qrp_calling", 14.060),
+            ("ncdxf_beacon", 14.100),
         ],
         "17m": [
-            ("18.110 NCDXF 信标", 18.110),
+            ("ncdxf_beacon", 18.110),
         ],
         "15m": [
-            ("21.060 QRP Calling", 21.060),
-            ("21.150 NCDXF 信标", 21.150),
+            ("qrp_calling", 21.060),
+            ("ncdxf_beacon", 21.150),
         ],
         "12m": [
-            ("24.930 NCDXF 信标", 24.930),
+            ("ncdxf_beacon", 24.930),
         ],
         "10m": [
-            ("28.060 QRP Calling", 28.060),
-            ("28.200 NCDXF 信标", 28.200),
+            ("qrp_calling", 28.060),
+            ("ncdxf_beacon", 28.200),
         ],
     }
 
@@ -296,11 +302,11 @@ def _select_menu(
     options: Sequence[T],
     render_option: "callable[[T], str]",
     default_index: int = 0,
+    help_text: str,
 ) -> T | None:
     if not options:
         return None
     index = max(0, min(int(default_index), len(options) - 1))
-    help_text = "↑↓ 选择 | Enter 确认 | Esc 取消"
 
     def build_panel() -> Panel:
         body = Text()
@@ -336,13 +342,70 @@ def _select_menu(
                 live.update(build_panel())
 
 
+def _select_language(
+    *,
+    localizer: UILocalizer,
+    supported_languages: tuple[str, ...],
+) -> UILocalizer:
+    options = list(supported_languages) if supported_languages else ["zh", "en", "ja"]
+    t = localizer.t
+    labels: dict[str, str] = {
+        "zh": t("common.language_zh"),
+        "en": t("common.language_en"),
+        "ja": t("common.language_ja"),
+    }
+    default_index = (
+        options.index(localizer.language) if localizer.language in options else 0
+    )
+    selected = _select_menu(
+        title=t("common.language_select_title"),
+        options=options,
+        render_option=lambda s: labels.get(str(s), str(s)),
+        default_index=default_index,
+        help_text=t("common.menu_help"),
+    )
+    if selected is None:
+        return localizer
+    return localizer.with_language(str(selected))
+
+
 def _prompt_monitor_wizard(
     *,
     servers: tuple[str, ...],
     band: str | None,
     freq: float | None,
     with_default_servers: bool,
-) -> tuple[tuple[str, ...], str, float]:
+    localizer: UILocalizer,
+    supported_languages: tuple[str, ...],
+) -> tuple[tuple[str, ...], str, float, UILocalizer]:
+    return _prompt_monitor_wizard_internal(
+        servers=servers,
+        band=band,
+        freq=freq,
+        with_default_servers=with_default_servers,
+        localizer=localizer,
+        supported_languages=supported_languages,
+        select_language=True,
+    )
+
+
+def _prompt_monitor_wizard_internal(
+    *,
+    servers: tuple[str, ...],
+    band: str | None,
+    freq: float | None,
+    with_default_servers: bool,
+    localizer: UILocalizer,
+    supported_languages: tuple[str, ...],
+    select_language: bool,
+) -> tuple[tuple[str, ...], str, float, UILocalizer]:
+    if select_language:
+        localizer = _select_language(
+            localizer=localizer,
+            supported_languages=supported_languages,
+        )
+    t = localizer.t
+
     presets = _band_presets()
     band_choices = list(presets.keys())
 
@@ -350,10 +413,11 @@ def _prompt_monitor_wizard(
     if not resolved_servers:
         candidates = _default_server_candidates() if with_default_servers else []
         primary = _select_menu(
-            title="选择主服务器",
+            title=t("wizard.select_primary_server"),
             options=candidates,
             render_option=lambda s: str(s),
             default_index=0,
+            help_text=t("common.menu_help"),
         )
         if primary is None:
             raise click.Abort()
@@ -361,17 +425,19 @@ def _prompt_monitor_wizard(
         remaining = [s for s in candidates if s != primary]
         if remaining:
             add_backup = _select_menu(
-                title="添加备用服务器？",
-                options=["不添加", "添加"],
-                render_option=lambda s: str(s),
+                title=t("wizard.add_backup_server"),
+                options=["not_add", "add"],
+                render_option=lambda s: t(f"wizard.{s}"),
                 default_index=0,
+                help_text=t("common.menu_help"),
             )
-            if add_backup == "添加":
+            if add_backup == "add":
                 backup = _select_menu(
-                    title="选择备用服务器",
+                    title=t("wizard.select_backup_server"),
                     options=remaining,
                     render_option=lambda s: str(s),
                     default_index=0,
+                    help_text=t("common.menu_help"),
                 )
                 if backup is None:
                     raise click.Abort()
@@ -381,10 +447,11 @@ def _prompt_monitor_wizard(
     resolved_band = band
     if resolved_band is None and freq is None:
         selected_band = _select_menu(
-            title="选择频段",
+            title=t("wizard.select_band"),
             options=band_choices,
             render_option=lambda s: str(s),
             default_index=(band_choices.index("40m") if "40m" in band_choices else 0),
+            help_text=t("common.menu_help"),
         )
         if selected_band is None:
             raise click.Abort()
@@ -395,18 +462,217 @@ def _prompt_monitor_wizard(
     resolved_freq = freq
     if resolved_freq is None:
         options = presets.get(resolved_band, presets["40m"])
-        labels = [label for label, _ in options]
+        preset_ids = [preset_id for preset_id, _ in options]
+        preset_freqs = dict(options)
         choice = _select_menu(
-            title="选择守听频点",
-            options=labels,
-            render_option=lambda s: str(s),
+            title=t("wizard.select_freq"),
+            options=preset_ids,
+            render_option=lambda s: t(
+                f"band_presets.{resolved_band}.{s}",
+                freq=float(preset_freqs[str(s)]),
+            ),
             default_index=0,
+            help_text=t("common.menu_help"),
         )
         if choice is None:
             raise click.Abort()
-        resolved_freq = dict(options)[str(choice)]
+        resolved_freq = preset_freqs[str(choice)]
 
-    return resolved_servers, resolved_band, float(resolved_freq)
+    return resolved_servers, resolved_band, float(resolved_freq), localizer
+
+
+def _prompt_qso_wizard(
+    *,
+    localizer: UILocalizer,
+    supported_languages: tuple[str, ...],
+) -> tuple[str, float, str | None, UILocalizer]:
+    localizer = _select_language(
+        localizer=localizer,
+        supported_languages=supported_languages,
+    )
+    t = localizer.t
+
+    candidates = _default_server_candidates()
+    selected_server = _select_menu(
+        title=t("home.select_server"),
+        options=candidates,
+        render_option=lambda s: str(s),
+        default_index=0,
+        help_text=t("common.menu_help"),
+    )
+    if selected_server is None:
+        raise click.Abort()
+
+    presets = _band_presets()
+    band_choices = list(presets.keys())
+    selected_band = _select_menu(
+        title=t("home.select_band"),
+        options=band_choices,
+        render_option=lambda s: str(s),
+        default_index=(band_choices.index("40m") if "40m" in band_choices else 0),
+        help_text=t("common.menu_help"),
+    )
+    if selected_band is None:
+        raise click.Abort()
+
+    band = str(selected_band)
+    options = presets.get(band, presets["40m"])
+    preset_ids = [preset_id for preset_id, _ in options]
+    preset_freqs = dict(options)
+    choice = _select_menu(
+        title=t("home.select_freq"),
+        options=preset_ids,
+        render_option=lambda s: t(
+            f"band_presets.{band}.{s}",
+            freq=float(preset_freqs[str(s)]),
+        ),
+        default_index=0,
+        help_text=t("common.menu_help"),
+    )
+    if choice is None:
+        raise click.Abort()
+    freq = float(preset_freqs[str(choice)])
+
+    callsign = click.prompt(
+        t("home.callsign_prompt"),
+        default=load_config().qso.default_callsign or "",
+        show_default=bool(load_config().qso.default_callsign),
+    ).strip()
+    resolved_callsign = callsign or None
+    return str(selected_server), freq, resolved_callsign, localizer
+
+
+def _run_single_entry() -> None:
+    from echofist.config import update_config
+
+    app_config = load_config()
+    localizer, supported_languages = get_ui_localizer(app_config.ui.language)
+    localizer = print_banner(localizer)
+
+    def pick_action() -> str:
+        t = localizer.t
+        selected_index = 0
+        options: list[str] = ["monitor", "qso", "exit"]
+
+        def render_option(value: str) -> str:
+            return t(f"home.{value}")
+
+        def build_panel() -> Panel:
+            body = Text()
+            for i, opt in enumerate(options):
+                prefix = "› " if i == selected_index else "  "
+                style = "bold cyan" if i == selected_index else "dim"
+                body.append(prefix + render_option(opt) + "\n", style=style)
+            body.append("\n" + t("home.help"), style="dim")
+            return Panel(body, title=t("home.title"), border_style="cyan")
+
+        with (
+            _KeyPoller() as poller,
+            Live(
+                build_panel(),
+                console=console,
+                screen=False,
+                refresh_per_second=20,
+            ) as live,
+        ):
+            while True:
+                event = poller.get_event()
+                if event is None:
+                    continue
+                if event == "esc":
+                    return "exit"
+                if event == "l":
+                    return "language"
+                if event == "enter":
+                    return options[selected_index]
+                if event in {"up", "left"}:
+                    selected_index = (selected_index - 1) % len(options)
+                    live.update(build_panel())
+                    continue
+                if event in {"down", "right"}:
+                    selected_index = (selected_index + 1) % len(options)
+                    live.update(build_panel())
+                    continue
+
+    while True:
+        action = pick_action()
+        if action == "exit":
+            return
+        if action == "language":
+            localizer = _select_language(
+                localizer=localizer,
+                supported_languages=supported_languages,
+            )
+            if localizer.language != app_config.ui.language:
+                app_config = update_config({"ui": {"language": localizer.language}})
+            continue
+        if action == "monitor":
+            resolved_servers: tuple[str, ...] = ()
+            resolved_band: str | None = None
+            resolved_freq: float | None = None
+            (
+                resolved_servers,
+                resolved_band,
+                resolved_freq,
+                localizer,
+            ) = _prompt_monitor_wizard_internal(
+                servers=resolved_servers,
+                band=resolved_band,
+                freq=resolved_freq,
+                with_default_servers=True,
+                localizer=localizer,
+                supported_languages=supported_languages,
+                select_language=False,
+            )
+            if localizer.language != app_config.ui.language:
+                app_config = update_config({"ui": {"language": localizer.language}})
+            result = asyncio.run(
+                monitor_mode(
+                    resolved_servers,
+                    float(resolved_freq),
+                    500,
+                    "cw",
+                    "",
+                    None,
+                    False,
+                    0.4,
+                    precheck=True,
+                    precheck_concurrency=5,
+                    precheck_timeout=1.2,
+                    precheck_verify_http=True,
+                    with_registry=True,
+                    registry_target=50,
+                    learn=True,
+                    max_store=int(load_config().kiwi_sources.max_total),
+                    with_default_servers=True,
+                    auto_switch=True,
+                    interactive=True,
+                    localizer=localizer,
+                    supported_languages=supported_languages,
+                )
+            )
+            if result == "restart":
+                continue
+            return
+        if action == "qso":
+            server, freq, callsign, localizer = _prompt_qso_wizard(
+                localizer=localizer,
+                supported_languages=supported_languages,
+            )
+            if localizer.language != app_config.ui.language:
+                app_config = update_config({"ui": {"language": localizer.language}})
+            asyncio.run(
+                qso_mode(
+                    server=server,
+                    freq=freq,
+                    callsign=callsign,
+                    auto_suggest=False,
+                    password="",
+                    play_audio=False,
+                    audio_gain=0.4,
+                )
+            )
+            return
 
 
 class AudioPlayer:
@@ -509,17 +775,25 @@ class AudioPlayer:
                     self._buffer.popleft()
 
 
-def print_banner() -> None:
+def print_banner(localizer: UILocalizer | None = None) -> UILocalizer:
     """打印应用横幅"""
+    if localizer is None:
+        try:
+            localizer = get_ui_localizer(load_config().ui.language)[0]
+        except Exception:
+            localizer = get_ui_localizer()[0]
+    t = localizer.t
+
     banner = Text()
     banner.append("EchoFist ", style="bold cyan")
-    banner.append("(回声手迹)", style="italic")
+    banner.append(f'({t("dashboard.app_tagline")})', style="italic")
     banner.append("\n")
-    banner.append("AI辅助等幅电报（CW）通讯软件", style="dim")
-    banner.append(f"\n版本: {__version__}", style="dim")
+    banner.append(t("banner.subtitle"), style="dim")
+    banner.append("\n" + t("banner.version", version=__version__), style="dim")
 
     console.print(Panel(banner, border_style="cyan"))
     console.print()
+    return localizer
 
 
 def print_kiwi_servers(servers: list) -> None:
@@ -787,14 +1061,16 @@ async def monitor_mode(
     with_default_servers: bool = True,
     auto_switch: bool = True,
     interactive: bool = False,
+    localizer: UILocalizer | None = None,
+    supported_languages: tuple[str, ...] | None = None,
 ) -> Literal["exit", "restart"]:
     """监听模式"""
-    console.print("[green]启动监听模式[/green]")
-    console.print(f"服务器: [cyan]{', '.join(servers)}[/cyan]")
-    console.print(f"频率: [yellow]{freq} MHz[/yellow]")
-    console.print(f"带宽: [blue]{bandwidth} Hz[/blue]")
-    console.print(f"模式: [magenta]{mode.upper()}[/magenta]")
-    console.print()
+    from echofist.config import update_config
+
+    if localizer is None or supported_languages is None:
+        lang = load_config().ui.language
+        localizer, supported_languages = get_ui_localizer(lang)
+    t = localizer.t
 
     registry: KiwiSourceRegistry | None = None
     registry_candidates: list[str] = []
@@ -814,7 +1090,7 @@ async def monitor_mode(
         if s and s not in server_candidates:
             server_candidates.append(s)
     if not server_candidates:
-        raise click.ClickException("未提供可用的 KiwiSDR 服务器")
+        raise click.ClickException(t("monitor.no_servers"))
 
     if precheck and len(server_candidates) > 1:
         original_candidates = list(server_candidates)
@@ -851,15 +1127,20 @@ async def monitor_mode(
         if server_candidates and original_candidates:
             best = server_candidates[0]
             if best != original_candidates[0]:
-                console.print(f"[dim]预检：已选最稳源 {best}[/dim]")
+                console.print(f'[dim]{t("monitor.precheck_best", server=best)}[/dim]')
         if learn and (added > 0 or disabled > 0):
-            console.print(f"[dim]预检学习：新增 {added} 淘汰 {disabled}[/dim]")
+            msg = t(
+                "monitor.precheck_learn",
+                added=added,
+                disabled=disabled,
+            )
+            console.print(f"[dim]{msg}[/dim]")
 
     server_index = 0
     current_server = server_candidates[server_index]
     client: KiwiSDRClient | None = None
     decoder = MorseDecoder()
-    dashboard = Dashboard()
+    dashboard = Dashboard(localizer=localizer)
     player: AudioPlayer | None = None
     audio_chunks_total = 0
     window_start = asyncio.get_running_loop().time()
@@ -910,7 +1191,7 @@ async def monitor_mode(
                 current_server = candidate
                 dashboard.update(
                     is_connected=False,
-                    connection_state="连接中",
+                    connection_state="connecting",
                     server=current_server,
                     play_audio_enabled=play_audio,
                     error_message=None,
@@ -932,13 +1213,13 @@ async def monitor_mode(
             if interactive:
                 console.print(
                     Panel(
-                        "无法连接到所选源，请返回重新选择。",
-                        title="连接失败",
+                        t("monitor.connect_failed_body"),
+                        title=t("monitor.connect_failed_title"),
                         border_style="red",
                     )
                 )
                 return "restart"
-            raise ConnectionError("无法连接到任意 KiwiSDR 服务器")
+            raise ConnectionError(t("monitor.connect_failed_any"))
         dashboard.update(
             is_connected=True,
             connection_state=None,
@@ -946,7 +1227,7 @@ async def monitor_mode(
             play_audio_enabled=play_audio,
             error_message=None,
         )
-        console.print("[green]✓ 已连接到KiwiSDR服务器[/green]")
+        console.print(f'[green]{t("monitor.connect_ok")}[/green]')
 
         if play_audio:
             player = AudioPlayer(
@@ -982,6 +1263,19 @@ async def monitor_mode(
                 if event == "b":
                     control = "restart"
                     break
+                if event == "l":
+                    localizer = _select_language(
+                        localizer=localizer,
+                        supported_languages=supported_languages,
+                    )
+                    update_config({"ui": {"language": localizer.language}})
+                    t = localizer.t
+                    dashboard.localizer = localizer
+                    layout["header"].update(dashboard.render_header())
+                    layout["waterfall"].update(dashboard.render_waterfall())
+                    layout["decoded"].update(dashboard.render_decoded_text())
+                    layout["status"].update(dashboard.render_status())
+                    continue
 
                 # 获取音频数据
                 audio_data = await client.get_audio_chunk(timeout_seconds=0.25)
@@ -1016,10 +1310,11 @@ async def monitor_mode(
                         consecutive_reconnects = 0
                         dashboard.update(
                             is_connected=False,
-                            connection_state="切换中",
+                            connection_state="switching",
                             server=current_server,
-                            error_message=(
-                                f"服务器不稳定，准备切换 {old_server} → ..."
+                            error_message=t(
+                                "monitor.switch_prepare",
+                                old_server=old_server,
                             ),
                             reconnect_count=reconnect_count,
                             server_switch_count=server_switch_count,
@@ -1044,8 +1339,10 @@ async def monitor_mode(
                                 continue
                             dashboard.update(
                                 server=candidate,
-                                error_message=(
-                                    f"服务器不稳定，切换 {old_server} → {candidate}"
+                                error_message=t(
+                                    "monitor.switch_now",
+                                    old_server=old_server,
+                                    new_server=candidate,
                                 ),
                             )
                             layout["header"].update(dashboard.render_header())
@@ -1090,7 +1387,10 @@ async def monitor_mode(
 
                         if not switched:
                             dashboard.update(
-                                error_message=(f"切换失败（{last_error}），稍后重试"),
+                                error_message=t(
+                                    "monitor.switch_failed",
+                                    error=last_error,
+                                ),
                                 server_switch_count=server_switch_count,
                             )
                         await asyncio.sleep(0.2)
@@ -1106,9 +1406,10 @@ async def monitor_mode(
                                 mode=mode,
                                 signal_strength=client.get_signal_strength(),
                                 is_connected=False,
-                                connection_state="重连中",
-                                error_message=(
-                                    f"音频断流 {audio_age:.1f}s，正在重连..."
+                                connection_state="reconnecting",
+                                error_message=t(
+                                    "monitor.reconnect_audio_stalled",
+                                    seconds=audio_age,
                                 ),
                                 server=current_server,
                                 audio_chunks_total=audio_chunks_total,
@@ -1161,18 +1462,25 @@ async def monitor_mode(
                                 )
                                 if auto_switch and len(server_candidates) > 1:
                                     dashboard.update(
-                                        connection_state="切换中",
-                                        error_message=(f"重连失败（{e}），尝试切换..."),
+                                        connection_state="switching",
+                                        error_message=t(
+                                            "monitor.reconnect_failed_switching",
+                                            error=str(e),
+                                        ),
                                     )
                                 else:
                                     dashboard.update(
-                                        error_message=f"重连失败（{e}）",
+                                        error_message=t(
+                                            "monitor.reconnect_failed",
+                                            error=str(e),
+                                        ),
                                     )
                     else:
                         if audio_age >= reconnect_warn_seconds:
                             dashboard.update(
-                                error_message=(
-                                    f"音频暂停 {audio_age:.1f}s，等待恢复..."
+                                error_message=t(
+                                    "monitor.audio_paused_wait",
+                                    seconds=audio_age,
                                 ),
                             )
                     dashboard.update(
@@ -1247,15 +1555,34 @@ async def monitor_mode(
         return control
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]正在停止监听...[/yellow]")
+        console.print(f'\n[yellow]{t("monitor.stop_listening")}[/yellow]')
         return "exit"
     except Exception as e:
-        logger.error(f"监听模式错误: {e}")
-        console.print(f"[red]错误: {e}[/red]")
+        logger.error(t("monitor.listen_error", error=str(e)))
+        console.print(f'[red]{t("monitor.error_prefix", error=str(e))}[/red]')
         return "exit"
     finally:
         if client:
-            await client.disconnect()
+            disconnect_task = asyncio.create_task(client.disconnect())
+            deadline = time.monotonic() + 3.2
+            shown: set[str] = set()
+            while True:
+                for ev in client.drain_events():
+                    if ev.name == "disconnecting" and ev.name not in shown:
+                        shown.add(ev.name)
+                        console.print(f'[dim]{t("monitor.disconnecting")}[/dim]')
+                    if ev.name == "disconnected" and ev.name not in shown:
+                        shown.add(ev.name)
+                        console.print(f'[dim]{t("monitor.disconnected")}[/dim]')
+                if disconnect_task.done():
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.05)
+            try:
+                await asyncio.wait_for(disconnect_task, timeout=0.1)
+            except Exception:
+                pass
         if player is not None:
             player.stop()
         if registry is not None:
@@ -1326,11 +1653,14 @@ async def qso_mode(
     audio_gain: float = 0.4,
 ) -> None:
     """QSO模式"""
-    console.print("[green]启动QSO模式[/green]")
-    console.print(f"服务器: [cyan]{server}[/cyan]")
-    console.print(f"频率: [yellow]{freq} MHz[/yellow]")
+    localizer = get_ui_localizer(load_config().ui.language)[0]
+    t = localizer.t
+
+    console.print(f'[green]{t("qso.start")}[/green]')
+    console.print(t("qso.server", server=server))
+    console.print(t("qso.freq", freq=freq))
     if callsign:
-        console.print(f"呼号: [blue]{callsign}[/blue]")
+        console.print(t("qso.callsign", callsign=callsign))
     console.print()
 
     # 创建状态机
@@ -1342,7 +1672,7 @@ async def qso_mode(
     try:
         # 连接服务器
         await client.connect()
-        console.print("[green]✓ 已连接到KiwiSDR服务器[/green]")
+        console.print(f'[green]{t("monitor.connect_ok")}[/green]')
 
         # 设置频率
         await client.set_frequency(freq)
@@ -1358,8 +1688,8 @@ async def qso_mode(
             )
             player.start()
 
-        console.print("[cyan]等待CW信号...[/cyan]")
-        console.print("按 Ctrl+C 停止")
+        console.print(f'[cyan]{t("qso.waiting_cw")}[/cyan]')
+        console.print(t("common.press_ctrl_c_stop"))
         console.print()
 
         while True:
@@ -1392,9 +1722,7 @@ async def qso_mode(
                 # 检查是否需要应答
                 if auto_suggest and state_machine.has_suggestion():
                     suggestion = state_machine.get_suggestion()
-                    console.print(
-                        f"[yellow]建议应答:[/yellow] [green]{suggestion}[/green]"
-                    )
+                    console.print(t("qso.suggestion", suggestion=suggestion))
 
                     # 这里可以添加自动发报逻辑
                     # await client.send_cw(suggestion)
@@ -1402,22 +1730,47 @@ async def qso_mode(
             await asyncio.sleep(0.1)
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]正在停止QSO...[/yellow]")
+        console.print(f'\n[yellow]{t("qso.stopping")}[/yellow]')
     except Exception as e:
-        logger.error(f"QSO模式错误: {e}")
-        console.print(f"[red]错误: {e}[/red]")
+        logger.error(t("qso.error", error=str(e)))
+        console.print(f'[red]{t("monitor.error_prefix", error=str(e))}[/red]')
     finally:
         if client:
-            await client.disconnect()
+            disconnect_task = asyncio.create_task(client.disconnect())
+            deadline = time.monotonic() + 3.2
+            shown: set[str] = set()
+            while True:
+                for ev in client.drain_events():
+                    if ev.name == "disconnecting" and ev.name not in shown:
+                        shown.add(ev.name)
+                        console.print(f'[dim]{t("monitor.disconnecting")}[/dim]')
+                    if ev.name == "disconnected" and ev.name not in shown:
+                        shown.add(ev.name)
+                        console.print(f'[dim]{t("monitor.disconnected")}[/dim]')
+                if disconnect_task.done():
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.05)
+            try:
+                await asyncio.wait_for(disconnect_task, timeout=0.1)
+            except Exception:
+                pass
         if player is not None:
             player.stop()
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version=__version__)
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """EchoFist - AI辅助等幅电报（CW）通讯软件"""
-    pass
+    if ctx.invoked_subcommand is not None:
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        click.echo(ctx.get_help())
+        return
+    _run_single_entry()
 
 
 @cli.command()
@@ -1647,7 +2000,8 @@ def sources_fetch(
 @sources.command("add")
 def sources_add() -> None:
     """交互式添加源：粘贴 host:port 列表并写入注册表"""
-    print_banner()
+    localizer = print_banner()
+    t = localizer.t
     registry = KiwiSourceRegistry()
     config = load_config()
     max_total = int(config.kiwi_sources.max_total)
@@ -1678,6 +2032,7 @@ def sources_add() -> None:
                 options=["已复制原始内容", "打开网页（自动）", "取消（VY 73）"],
                 render_option=lambda s: str(s),
                 default_index=0,
+                help_text=t("common.menu_help"),
             )
             if action == "取消（VY 73）" or action is None:
                 console.print("[dim]VY 73[/dim]")
@@ -1712,6 +2067,7 @@ def sources_add() -> None:
                 ],
                 render_option=lambda s: str(s),
                 default_index=0,
+                help_text=t("common.menu_help"),
             )
             if action == "取消（VY 73）" or action is None:
                 console.print("[dim]VY 73[/dim]")
@@ -1751,6 +2107,7 @@ def sources_add() -> None:
                             options=["重新粘贴", "返回模板", "取消（VY 73）"],
                             render_option=lambda s: str(s),
                             default_index=0,
+                            help_text=t("common.menu_help"),
                         )
                         if action2 == "取消（VY 73）" or action2 is None:
                             console.print("[dim]VY 73[/dim]")
@@ -1774,6 +2131,7 @@ def sources_add() -> None:
                         options=["导入", "重试粘贴", "取消（VY 73）"],
                         render_option=lambda s: str(s),
                         default_index=0,
+                        help_text=t("common.menu_help"),
                     )
                     if action3 == "重试粘贴":
                         continue
@@ -2098,7 +2456,11 @@ def monitor(
     mode: str,
 ) -> None:
     """监听模式 - 实时解码CW信号"""
-    print_banner()
+    from echofist.config import update_config
+
+    app_config = load_config()
+    localizer, supported_languages = get_ui_localizer(app_config.ui.language)
+    localizer = print_banner(localizer)
     resolved_servers = server
     resolved_band = band
     resolved_freq: float | None = freq
@@ -2106,12 +2468,21 @@ def monitor(
 
     if use_wizard:
         while True:
-            resolved_servers, resolved_band, resolved_freq = _prompt_monitor_wizard(
+            (
+                resolved_servers,
+                resolved_band,
+                resolved_freq,
+                localizer,
+            ) = _prompt_monitor_wizard(
                 servers=resolved_servers,
                 band=resolved_band,
                 freq=resolved_freq,
                 with_default_servers=with_default_servers,
+                localizer=localizer,
+                supported_languages=supported_languages,
             )
+            if localizer.language != app_config.ui.language:
+                app_config = update_config({"ui": {"language": localizer.language}})
             action = asyncio.run(
                 monitor_mode(
                     resolved_servers,
@@ -2133,6 +2504,8 @@ def monitor(
                     with_default_servers=with_default_servers,
                     auto_switch=auto_switch,
                     interactive=True,
+                    localizer=localizer,
+                    supported_languages=supported_languages,
                 )
             )
             if action == "restart":
@@ -2143,13 +2516,13 @@ def monitor(
             break
     else:
         if not resolved_servers:
-            raise click.ClickException("缺少 --server/-s，或启用 --wizard 交互选择")
+            raise click.ClickException(localizer.t("monitor.cli_missing_server"))
         if resolved_freq is None:
             presets = _band_presets()
             if resolved_band and resolved_band in presets:
                 resolved_freq = presets[resolved_band][0][1]
             else:
-                raise click.ClickException("缺少 --freq/-f，或启用 --wizard 交互选择")
+                raise click.ClickException(localizer.t("monitor.cli_missing_freq"))
         asyncio.run(
             monitor_mode(
                 resolved_servers,
@@ -2170,6 +2543,8 @@ def monitor(
                 max_store=max_store,
                 with_default_servers=with_default_servers,
                 auto_switch=auto_switch,
+                localizer=localizer,
+                supported_languages=supported_languages,
             )
         )
 
