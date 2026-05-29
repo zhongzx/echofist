@@ -49,6 +49,7 @@ Thumbs.db
 # Project specific
 *.log
 *.sqlite
+*.sqlite3
 *.db
 *.cache
 .coverage

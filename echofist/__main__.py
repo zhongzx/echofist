@@ -1575,6 +1575,316 @@ async def probe_mode(
     )
 
 
+async def listen_mode(
+    servers: tuple[str, ...],
+    freq: float,
+    bandwidth: int,
+    mode: str,
+    password: str,
+    ident_user: str | None,
+    *,
+    seconds: float,
+    play_audio: bool,
+    audio_gain: float,
+    scan_range: str | None,
+    scan_step_hz: int,
+    scan_dwell_seconds: float,
+    with_default_servers: bool,
+    with_registry: bool,
+    registry_target: int,
+    precheck_concurrency: int,
+    precheck_timeout: float,
+    precheck_verify_http: bool,
+    precheck_fetch_status: bool,
+    learn: bool,
+    max_store: int,
+) -> None:
+    registry: KiwiSourceRegistry | None = None
+    candidates: list[str] = []
+    try:
+        if with_registry or learn:
+            try:
+                registry = KiwiSourceRegistry()
+            except Exception:
+                registry = None
+        if with_registry and registry is not None:
+            candidates.extend(registry.pick_servers(target=registry_target))
+        if with_default_servers:
+            candidates.extend(_default_server_candidates())
+        candidates.extend(list(servers))
+
+        seen: set[str] = set()
+        server_candidates: list[str] = []
+        for s in candidates:
+            text = str(s).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            server_candidates.append(text)
+
+        if not server_candidates:
+            raise click.ClickException("没有可用的候选电台")
+
+        scan_results = await scan_kiwi_reachability(
+            server_candidates,
+            concurrency=precheck_concurrency,
+            timeout_seconds=precheck_timeout,
+            verify_http=precheck_verify_http,
+            fetch_status=precheck_fetch_status,
+        )
+        if learn and registry is not None:
+            registry.record_scans(scan_results, max_total=max_store)
+
+        ok = []
+        for r in scan_results:
+            if not r.tcp_ok:
+                continue
+            if (
+                precheck_fetch_status
+                and r.status_ok
+                and r.users is not None
+                and r.users_max is not None
+                and int(r.users) >= int(r.users_max)
+            ):
+                continue
+            ok.append(r)
+        if not ok:
+            ok = [r for r in scan_results if r.tcp_ok]
+        if not ok:
+            raise click.ClickException("候选电台全部不可达")
+
+        ok.sort(
+            key=lambda r: (
+                r.latency_ms is None,
+                float(r.latency_ms or 10_000.0),
+                r.server,
+            )
+        )
+        best = ok[0]
+
+        users_text = "?"
+        if best.users is not None and best.users_max is not None:
+            users_text = f"{best.users}/{best.users_max}"
+        latency_text = "?"
+        if best.latency_ms is not None:
+            latency_text = f"{best.latency_ms:.1f}"
+
+        scan_text = "否"
+        if scan_range is not None and str(scan_range).strip():
+            raw = str(scan_range).strip()
+            parts = raw.split("-", 1)
+            if len(parts) != 2:
+                raise click.ClickException(f"无效的扫描范围: {raw}")
+            try:
+                a = float(parts[0].strip())
+                b = float(parts[1].strip())
+            except ValueError as e:
+                raise click.ClickException(f"无效的扫描范围: {raw}") from e
+            lo = min(a, b)
+            hi = max(a, b)
+            if not (1.8 <= lo <= 30.0 and 1.8 <= hi <= 30.0):
+                raise click.ClickException(f"扫描范围超出业余段(1.8-30MHz): {lo}-{hi}")
+            if hi - lo < 0.000_001:
+                raise click.ClickException(f"扫描范围过窄: {lo}-{hi}")
+            scan_text = (
+                f"是 ({lo:.3f}-{hi:.3f} MHz, step={int(scan_step_hz)} Hz, "
+                f"dwell={float(scan_dwell_seconds):.1f}s)"
+            )
+
+        console.print(
+            Panel(
+                "\n".join(
+                    [
+                        f"候选数: {len(server_candidates)}",
+                        f"选择: {best.server}",
+                        f"延迟(ms): {latency_text}",
+                        f"用户数: {users_text}",
+                        f"模式: {mode.upper()}",
+                        f"频率: {freq:.3f} MHz",
+                        f"带宽: {bandwidth} Hz",
+                        f"播放: {'是' if play_audio else '否'}",
+                        f"扫描: {scan_text}",
+                    ]
+                ),
+                title="Listen 计划",
+                border_style="cyan",
+            )
+        )
+    finally:
+        if registry is not None:
+            registry.close()
+
+    client = KiwiSDRClient(best.server, password=password, ident_user=ident_user)
+    decoder = MorseDecoder()
+    player: AudioPlayer | None = None
+
+    scan_freqs_hz: list[int] = []
+    scan_index = 0
+    step_hz: int | None = None
+    if scan_range is not None and str(scan_range).strip() != "":
+        raw = str(scan_range).strip()
+        parts = raw.split("-", 1)
+        a = float(parts[0].strip())
+        b = float(parts[1].strip())
+        lo = min(a, b)
+        hi = max(a, b)
+        step_hz = int(scan_step_hz)
+        if step_hz <= 0:
+            raise click.ClickException(f"无效的 scan_step_hz: {scan_step_hz}")
+        lo_hz = int(round(float(lo) * 1_000_000.0))
+        hi_hz = int(round(float(hi) * 1_000_000.0))
+        n_max = 600
+        f_hz = int(lo_hz)
+        while f_hz <= int(hi_hz) and len(scan_freqs_hz) < n_max:
+            scan_freqs_hz.append(int(f_hz))
+            f_hz += int(step_hz)
+        if not scan_freqs_hz:
+            raise click.ClickException(f"扫描范围没有产生任何频点: {raw}")
+        if float(scan_dwell_seconds) <= 0.0:
+            raise click.ClickException(
+                f"无效的 scan_dwell_seconds: {scan_dwell_seconds}"
+            )
+
+    await client.connect()
+    await client.set_mode(mode)
+    tuned_freq_hz = (
+        int(scan_freqs_hz[0])
+        if scan_freqs_hz
+        else int(round(float(freq) * 1_000_000.0))
+    )
+    tuned_freq_mhz = float(tuned_freq_hz) / 1_000_000.0
+    await client.set_frequency(tuned_freq_mhz)
+    await client.set_bandwidth(bandwidth)
+    await client.start_audio_stream()
+
+    if play_audio:
+        player = AudioPlayer(
+            input_rate=decoder.sample_rate,
+            gain=audio_gain,
+        )
+        player.start()
+
+    start = time.monotonic()
+    last_print = start
+    chunks = 0
+    rms_sum = 0.0
+    rms_n = 0
+    timeouts = 0
+    decoded_lines = 0
+    scan_next_tune_at = start + float(scan_dwell_seconds)
+    per_freq: dict[int, tuple[float, int, int]] = {}
+
+    try:
+        while time.monotonic() - start < float(seconds):
+            if scan_freqs_hz and step_hz is not None:
+                now_mono = time.monotonic()
+                if now_mono >= scan_next_tune_at:
+                    scan_index = (scan_index + 1) % len(scan_freqs_hz)
+                    tuned_freq_hz = int(scan_freqs_hz[scan_index])
+                    tuned_freq_mhz = float(tuned_freq_hz) / 1_000_000.0
+                    try:
+                        await client.set_frequency(tuned_freq_mhz)
+                        console.print(f"[dim]scan freq={tuned_freq_mhz:.6f} MHz[/dim]")
+                        if player is not None:
+                            player.clear()
+                    except Exception:
+                        await asyncio.sleep(0.05)
+                        break
+                    scan_next_tune_at = now_mono + float(scan_dwell_seconds)
+
+            audio_data = await client.get_audio_chunk(timeout_seconds=0.5)
+            if audio_data is None:
+                timeouts += 1
+                if not client.connected:
+                    await asyncio.sleep(0.05)
+                    break
+                if client.get_last_audio_age_seconds() >= 12.0:
+                    await asyncio.sleep(0.05)
+                    break
+                await asyncio.sleep(0.01)
+                continue
+
+            chunks += 1
+            if player is not None:
+                player.feed(audio_data)
+
+            rms: float | None = None
+            if audio_data.size:
+                rms = float(np.sqrt(np.mean(audio_data * audio_data)))
+                rms_sum += float(rms)
+                rms_n += 1
+            decoded_text, confidence = decoder.decode(audio_data)
+            decoded_hit = 1 if (decoded_text and confidence >= 0.7) else 0
+            decoded_lines += decoded_hit
+
+            if rms is not None:
+                prev = per_freq.get(tuned_freq_hz)
+                if prev is None:
+                    per_freq[tuned_freq_hz] = (float(rms), 1, int(decoded_hit))
+                else:
+                    s, n, d = prev
+                    per_freq[tuned_freq_hz] = (
+                        float(s + float(rms)),
+                        int(n + 1),
+                        int(d + int(decoded_hit)),
+                    )
+
+            now = time.monotonic()
+            if now - last_print >= 15.0:
+                avg_rms = (rms_sum / rms_n) if rms_n else 0.0
+                console.print(
+                    f"[{now - start:5.1f}s] "
+                    f"freq={tuned_freq_mhz:.6f} "
+                    f"chunks={chunks} "
+                    f"avg_rms={avg_rms:.4f} "
+                    f"queue={client.get_audio_queue_size()} "
+                    f"audio_age={client.get_last_audio_age_seconds():.2f}s "
+                    f"playback_ms={(player.buffered_ms() if player else 0.0):.1f} "
+                    f"decoded_lines={decoded_lines} "
+                    f"timeouts={timeouts}"
+                )
+                last_print = now
+    finally:
+        await client.disconnect()
+        if player is not None:
+            player.stop()
+
+    avg_rms = (rms_sum / rms_n) if rms_n else 0.0
+    best_freq_lines: list[str] = []
+    if per_freq:
+        ranked = sorted(
+            per_freq.items(),
+            key=lambda kv: (
+                -int(kv[1][2]),
+                -(float(kv[1][0]) / max(1, int(kv[1][1]))),
+                float(kv[0]),
+            ),
+        )
+        for f_hz, (s, n, d) in ranked[:8]:
+            avg = float(s) / max(1, int(n))
+            f_mhz = float(int(f_hz)) / 1_000_000.0
+            best_freq_lines.append(
+                f"{f_mhz:.6f} MHz  decoded={int(d)}  " f"avg_rms={avg:.4f}"
+            )
+    console.print(
+        Panel(
+            "\n".join(
+                [
+                    f"服务器: {best.server}",
+                    f"时长: {seconds:.1f}s",
+                    f"采样块: {chunks}",
+                    f"平均RMS: {avg_rms:.4f}",
+                    f"高置信度解码行数: {decoded_lines}",
+                    f"超时次数: {timeouts}",
+                    *best_freq_lines,
+                ]
+            ),
+            title="Listen 结果",
+            border_style="green",
+        )
+    )
+
+
 async def qso_mode(
     server: str,
     freq: float,
@@ -1812,6 +2122,153 @@ def probe(
             password=password,
             ident_user=user,
             seconds=seconds,
+        )
+    )
+
+
+@cli.command()
+@click.option(
+    "--server",
+    "-s",
+    multiple=True,
+    default=(),
+    help="KiwiSDR服务器地址（可重复多次，按顺序作为候选）",
+)
+@click.option("--freq", "-f", type=float, default=7.023, help="频率 (MHz)")
+@click.option("--bandwidth", "-b", type=int, default=500, help="带宽 (Hz)")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["am", "cw", "usb", "lsb"]),
+    default="cw",
+    help="接收模式",
+)
+@click.option("--password", "-p", default="", help="服务器密码（如有）")
+@click.option("--user", "-u", default=None, help="显示在服务器上的用户标识")
+@click.option("--seconds", "-t", type=float, default=180.0, help="侦听时长（秒）")
+@click.option("--play-audio", is_flag=True, help="播放接收到的音频到默认输出设备")
+@click.option("--audio-gain", type=float, default=0.5, help="播放音量增益 (0-2)")
+@click.option(
+    "--with-default-servers/--no-default-servers",
+    default=True,
+    help="是否附加内置候选服务器列表",
+)
+@click.option(
+    "--with-registry/--no-with-registry",
+    default=True,
+    help="是否附加本地注册表中的候选源",
+)
+@click.option(
+    "--registry-target",
+    type=click.IntRange(1, 200),
+    default=50,
+    show_default=True,
+    help="从注册表挑选的目标数量",
+)
+@click.option(
+    "--precheck-concurrency",
+    type=click.IntRange(1, 10),
+    default=5,
+    show_default=True,
+    help="预检并发量（推荐 5，上限 10）",
+)
+@click.option(
+    "--precheck-timeout",
+    type=float,
+    default=1.2,
+    show_default=True,
+    help="预检单个目标超时（秒）",
+)
+@click.option(
+    "--precheck-verify-http/--no-precheck-verify-http",
+    default=True,
+    help="预检时是否请求 /VER",
+)
+@click.option(
+    "--precheck-fetch-status/--no-precheck-fetch-status",
+    default=True,
+    help="预检时是否请求 /status 并跳过满员电台",
+)
+@click.option(
+    "--scan-range",
+    type=str,
+    default=None,
+    help="侦听过程中模拟频点扫描（MHz范围），例如：7.000-7.030",
+)
+@click.option(
+    "--scan-step-hz",
+    type=click.IntRange(50, 5000),
+    default=200,
+    show_default=True,
+    help="扫描步进（Hz）",
+)
+@click.option(
+    "--scan-dwell",
+    type=float,
+    default=3.0,
+    show_default=True,
+    help="每个频点停留时间（秒）",
+)
+@click.option(
+    "--learn/--no-learn",
+    default=True,
+    help="是否把预检结果写入本地注册表（用于增量积累与淘汰）",
+)
+@click.option(
+    "--max-store",
+    type=click.IntRange(50, 1000),
+    default=1000,
+    show_default=True,
+    help="注册表总量上限",
+)
+def listen(
+    server: tuple[str, ...],
+    freq: float,
+    bandwidth: int,
+    mode: str,
+    password: str,
+    user: str | None,
+    seconds: float,
+    play_audio: bool,
+    audio_gain: float,
+    with_default_servers: bool,
+    with_registry: bool,
+    registry_target: int,
+    precheck_concurrency: int,
+    precheck_timeout: float,
+    precheck_verify_http: bool,
+    precheck_fetch_status: bool,
+    scan_range: str | None,
+    scan_step_hz: int,
+    scan_dwell: float,
+    learn: bool,
+    max_store: int,
+) -> None:
+    """自动选台并侦听一段时间（可选播放音频）"""
+    print_banner()
+    asyncio.run(
+        listen_mode(
+            server,
+            freq,
+            bandwidth,
+            mode,
+            password,
+            user,
+            seconds=seconds,
+            play_audio=play_audio,
+            audio_gain=audio_gain,
+            scan_range=scan_range,
+            scan_step_hz=scan_step_hz,
+            scan_dwell_seconds=scan_dwell,
+            with_default_servers=with_default_servers,
+            with_registry=with_registry,
+            registry_target=registry_target,
+            precheck_concurrency=precheck_concurrency,
+            precheck_timeout=precheck_timeout,
+            precheck_verify_http=precheck_verify_http,
+            precheck_fetch_status=precheck_fetch_status,
+            learn=learn,
+            max_store=max_store,
         )
     )
 
