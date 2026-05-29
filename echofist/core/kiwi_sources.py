@@ -1,13 +1,8 @@
-"""
-KiwiSDR 源注册表（SQLite）
-
-目标：
-- 温和扫描：只做可达性与稳定性评估，不做高频/大并发压力探测
-- 每次运行增量积累：逐日增加新源、记录扫描结果、淘汰不稳定源
-"""
+"""KiwiSDR 源注册表（SQLite）。"""
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import sqlite3
@@ -15,6 +10,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import aiohttp
 
@@ -109,6 +105,11 @@ class KiwiSourceSummary:
     consecutive_failures: int
     last_latency_ms: float | None
     last_seen_ts: int | None
+    last_users: int | None
+    last_users_max: int | None
+    last_status_ts: int | None
+    last_audio_ok_ts: int | None
+    audio_dropouts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,9 +117,46 @@ class KiwiScanHistoryRow:
     ts: int
     tcp_ok: bool
     latency_ms: float | None
+    tcp_ms: float | None
     http_status: int | None
+    http_ok: bool | None
+    http_ms: float | None
     kiwi_ts: int | None
+    status_ok: bool | None
+    users: int | None
+    users_max: int | None
+    total_ms: float | None
+    error_kind: str | None
+    run_id: str | None
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class KiwiBlockedSourceRow:
+    server: str
+    kind: str
+    first_ts: int
+    last_ts: int
+    expires_ts: int | None
+    hits: int
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class KiwiScanDailyRow:
+    day: str
+    server: str
+    scans: int
+    tcp_ok: int
+    tcp_fail: int
+    ok_latency_sum_ms: float
+    ok_latency_n: int
+    status_samples: int
+    status_samples_trusted: int
+    full_trusted: int
+    users_sum_trusted: int
+    users_max_sum_trusted: int
+    updated_ts: int
 
 
 def default_registry_path() -> Path:
@@ -206,13 +244,75 @@ class KiwiSourceRegistry:
             """
             CREATE TABLE IF NOT EXISTS scan_history (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT,
               ts INTEGER NOT NULL,
               server TEXT NOT NULL,
               tcp_ok INTEGER NOT NULL,
               latency_ms REAL,
+              tcp_ms REAL,
               http_status INTEGER,
+              http_ok INTEGER,
+              http_ms REAL,
               kiwi_ts INTEGER,
+              status_ok INTEGER,
+              users INTEGER,
+              users_max INTEGER,
+              total_ms REAL,
+              error_kind TEXT,
               error TEXT
+            )
+            """
+        )
+        self._ensure_scan_history_columns(cur)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_runs (
+              run_id TEXT PRIMARY KEY,
+              started_ts INTEGER NOT NULL,
+              finished_ts INTEGER,
+              mode TEXT NOT NULL,
+              concurrency INTEGER NOT NULL,
+              timeout_seconds REAL NOT NULL,
+              verify_http INTEGER NOT NULL,
+              candidate_source TEXT NOT NULL,
+              limit_n INTEGER NOT NULL,
+              registry_path TEXT NOT NULL,
+              ok INTEGER,
+              fail INTEGER,
+              avg_latency_ms REAL,
+              prune_disabled INTEGER,
+              expired_blocks INTEGER,
+              note TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS probe_budget_day (
+              day TEXT PRIMARY KEY,
+              used INTEGER NOT NULL,
+              cap INTEGER NOT NULL,
+              updated_ts INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_daily (
+              day TEXT NOT NULL,
+              server TEXT NOT NULL,
+              scans INTEGER NOT NULL,
+              tcp_ok INTEGER NOT NULL,
+              tcp_fail INTEGER NOT NULL,
+              ok_latency_sum_ms REAL NOT NULL,
+              ok_latency_n INTEGER NOT NULL,
+              status_samples INTEGER NOT NULL,
+              status_samples_trusted INTEGER NOT NULL,
+              full_trusted INTEGER NOT NULL,
+              users_sum_trusted INTEGER NOT NULL,
+              users_max_sum_trusted INTEGER NOT NULL,
+              updated_ts INTEGER NOT NULL,
+              PRIMARY KEY(day, server)
             )
             """
         )
@@ -228,6 +328,50 @@ class KiwiSourceRegistry:
             ON monitor_events(server, ts)
             """
         )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runs_started_ts
+            ON scan_runs(started_ts)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_probe_budget_updated_ts
+            ON probe_budget_day(updated_ts)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scan_daily_day
+            ON scan_daily(day)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_scan_daily_server_day
+            ON scan_daily(server, day)
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blocked_sources (
+              server TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              first_ts INTEGER NOT NULL,
+              last_ts INTEGER NOT NULL,
+              expires_ts INTEGER,
+              hits INTEGER NOT NULL DEFAULT 1,
+              reason TEXT,
+              PRIMARY KEY(server, kind)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_blocked_kind_expires
+            ON blocked_sources(kind, expires_ts)
+            """
+        )
         self._conn.commit()
 
     def _ensure_sources_columns(self, cur: sqlite3.Cursor) -> None:
@@ -236,11 +380,669 @@ class KiwiSourceRegistry:
         additions = [
             ("monitor_reconnects", "monitor_reconnects INTEGER NOT NULL DEFAULT 0"),
             ("monitor_switches", "monitor_switches INTEGER NOT NULL DEFAULT 0"),
+            ("cooldown_until_ts", "cooldown_until_ts INTEGER"),
+            ("next_probe_ts", "next_probe_ts INTEGER"),
+            ("backoff_level", "backoff_level INTEGER NOT NULL DEFAULT 0"),
+            ("last_users", "last_users INTEGER"),
+            ("last_users_max", "last_users_max INTEGER"),
+            ("last_status_ts", "last_status_ts INTEGER"),
+            ("last_audio_ok_ts", "last_audio_ok_ts INTEGER"),
+            ("last_audio_fail_ts", "last_audio_fail_ts INTEGER"),
+            ("audio_dropouts", "audio_dropouts INTEGER NOT NULL DEFAULT 0"),
         ]
         for name, ddl in additions:
             if name in existing:
                 continue
             cur.execute(f"ALTER TABLE sources ADD COLUMN {ddl}")
+
+    def _ensure_scan_history_columns(self, cur: sqlite3.Cursor) -> None:
+        rows = cur.execute("PRAGMA table_info(scan_history)").fetchall()
+        existing = {str(r[1]) for r in rows}
+        additions = [
+            ("run_id", "run_id TEXT"),
+            ("tcp_ms", "tcp_ms REAL"),
+            ("http_ok", "http_ok INTEGER"),
+            ("http_ms", "http_ms REAL"),
+            ("total_ms", "total_ms REAL"),
+            ("error_kind", "error_kind TEXT"),
+            ("status_ok", "status_ok INTEGER"),
+            ("users", "users INTEGER"),
+            ("users_max", "users_max INTEGER"),
+        ]
+        for name, ddl in additions:
+            if name in existing:
+                continue
+            cur.execute(f"ALTER TABLE scan_history ADD COLUMN {ddl}")
+
+    def start_scan_run(
+        self,
+        *,
+        mode: str,
+        concurrency: int,
+        timeout_seconds: float,
+        verify_http: bool,
+        candidate_source: str,
+        limit_n: int,
+        note: str | None = None,
+    ) -> str:
+        run_id = uuid4().hex
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO scan_runs(
+              run_id,
+              started_ts,
+              mode,
+              concurrency,
+              timeout_seconds,
+              verify_http,
+              candidate_source,
+              limit_n,
+              registry_path,
+              note
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                ts,
+                str(mode),
+                int(concurrency),
+                float(timeout_seconds),
+                1 if bool(verify_http) else 0,
+                str(candidate_source),
+                int(limit_n),
+                str(self._path),
+                note,
+            ),
+        )
+        self._conn.commit()
+        return run_id
+
+    def finish_scan_run(
+        self,
+        run_id: str,
+        *,
+        ok: int,
+        fail: int,
+        avg_latency_ms: float | None,
+        prune_disabled: int,
+        expired_blocks: int,
+    ) -> None:
+        text = str(run_id).strip()
+        if not text:
+            return
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            UPDATE scan_runs SET
+              finished_ts=?,
+              ok=?,
+              fail=?,
+              avg_latency_ms=?,
+              prune_disabled=?,
+              expired_blocks=?
+            WHERE run_id=?
+            """,
+            (
+                ts,
+                int(ok),
+                int(fail),
+                float(avg_latency_ms) if avg_latency_ms is not None else None,
+                int(prune_disabled),
+                int(expired_blocks),
+                text,
+            ),
+        )
+        self._conn.commit()
+
+    def _expire_blocks_cur(self, cur: sqlite3.Cursor, *, now_ts: int) -> int:
+        return int(
+            cur.execute(
+                """
+                DELETE FROM blocked_sources
+                WHERE expires_ts IS NOT NULL AND expires_ts <= ?
+                """,
+                (int(now_ts),),
+            ).rowcount
+        )
+
+    def expire_blocks(self) -> int:
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        deleted = self._expire_blocks_cur(cur, now_ts=ts)
+        self._conn.commit()
+        return int(deleted)
+
+    def block_source(
+        self,
+        server: str,
+        *,
+        kind: str,
+        reason: str | None = None,
+        ttl_days: int | None = None,
+        expires_ts: int | None = None,
+    ) -> None:
+        text = str(server).strip()
+        if not text:
+            return
+        try:
+            parse_kiwi_server_address(text)
+        except Exception:
+            return
+
+        ts = _now_ts()
+        ttl = None if ttl_days is None else max(0, int(ttl_days))
+        until = int(expires_ts) if expires_ts is not None else None
+        if until is None and ttl is not None and ttl > 0:
+            until = ts + ttl * 86400
+
+        cur = self._conn.cursor()
+        self._expire_blocks_cur(cur, now_ts=ts)
+        cur.execute(
+            """
+            INSERT INTO blocked_sources(
+              server,
+              kind,
+              first_ts,
+              last_ts,
+              expires_ts,
+              hits,
+              reason
+            )
+            VALUES(?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(server, kind) DO UPDATE SET
+              last_ts=excluded.last_ts,
+              expires_ts=COALESCE(excluded.expires_ts, blocked_sources.expires_ts),
+              hits=blocked_sources.hits + 1,
+              reason=COALESCE(excluded.reason, blocked_sources.reason)
+            """,
+            (text, str(kind), ts, ts, until, reason),
+        )
+        if str(kind) == "blacklist":
+            cur.execute(
+                "UPDATE sources SET enabled=0 WHERE server=?",
+                (text,),
+            )
+        self._conn.commit()
+
+    def unblock_source(self, server: str, *, kind: str | None = None) -> int:
+        text = str(server).strip()
+        if not text:
+            return 0
+        cur = self._conn.cursor()
+        if kind is None:
+            n = cur.execute(
+                "DELETE FROM blocked_sources WHERE server=?",
+                (text,),
+            ).rowcount
+        else:
+            n = cur.execute(
+                "DELETE FROM blocked_sources WHERE server=? AND kind=?",
+                (text, str(kind)),
+            ).rowcount
+        self._conn.commit()
+        return int(n)
+
+    def is_blocked(self, server: str, *, kind: str | None = None) -> bool:
+        text = str(server).strip()
+        if not text:
+            return False
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        if kind is None:
+            row = cur.execute(
+                """
+                SELECT 1 FROM blocked_sources
+                WHERE server=?
+                  AND (expires_ts IS NULL OR expires_ts > ?)
+                LIMIT 1
+                """,
+                (text, int(ts)),
+            ).fetchone()
+        else:
+            row = cur.execute(
+                """
+                SELECT 1 FROM blocked_sources
+                WHERE server=? AND kind=?
+                  AND (expires_ts IS NULL OR expires_ts > ?)
+                LIMIT 1
+                """,
+                (text, str(kind), int(ts)),
+            ).fetchone()
+        if row is None:
+            return False
+        return True
+
+    def list_blocked(
+        self,
+        *,
+        kind: str | None = None,
+        limit: int = 200,
+    ) -> list[KiwiBlockedSourceRow]:
+        lim = max(1, int(limit))
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        if kind is None:
+            rows = cur.execute(
+                """
+                SELECT server, kind, first_ts, last_ts, expires_ts, hits, reason
+                FROM blocked_sources
+                WHERE expires_ts IS NULL OR expires_ts > ?
+                ORDER BY kind ASC, last_ts DESC, server ASC
+                LIMIT ?
+                """,
+                (int(ts), lim),
+            ).fetchall()
+        else:
+            rows = cur.execute(
+                """
+                SELECT server, kind, first_ts, last_ts, expires_ts, hits, reason
+                FROM blocked_sources
+                WHERE kind=?
+                  AND (expires_ts IS NULL OR expires_ts > ?)
+                ORDER BY last_ts DESC, server ASC
+                LIMIT ?
+                """,
+                (str(kind), int(ts), lim),
+            ).fetchall()
+        out: list[KiwiBlockedSourceRow] = []
+        for r in rows:
+            out.append(
+                KiwiBlockedSourceRow(
+                    server=str(r["server"]),
+                    kind=str(r["kind"]),
+                    first_ts=int(r["first_ts"]),
+                    last_ts=int(r["last_ts"]),
+                    expires_ts=(
+                        int(r["expires_ts"]) if r["expires_ts"] is not None else None
+                    ),
+                    hits=int(r["hits"]),
+                    reason=str(r["reason"]) if r["reason"] is not None else None,
+                )
+            )
+        return out
+
+    def count_scan_days(
+        self,
+        server: str,
+        *,
+        lookback_days: int = 90,
+    ) -> int:
+        text = str(server).strip()
+        if not text:
+            return 0
+        days = max(1, int(lookback_days))
+        cutoff = _now_ts() - days * 86400
+        cur = self._conn.cursor()
+        row = cur.execute(
+            """
+            SELECT COUNT(DISTINCT date(ts, 'unixepoch')) AS n
+            FROM scan_history
+            WHERE server=? AND ts >= ?
+            """,
+            (text, int(cutoff)),
+        ).fetchone()
+        return int(row["n"]) if row is not None and row["n"] is not None else 0
+
+    def rollup_scan_daily(
+        self,
+        *,
+        lookback_days: int = 120,
+        max_trusted_users_max: int = 8,
+    ) -> int:
+        now_ts = _now_ts()
+        days = max(1, int(lookback_days))
+        cutoff_ts = int(now_ts) - days * 86400
+        max_trusted = max(1, int(max_trusted_users_max))
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT
+              date(ts, 'unixepoch') AS day,
+              server AS server,
+              COUNT(1) AS scans,
+              SUM(CASE WHEN tcp_ok=1 THEN 1 ELSE 0 END) AS tcp_ok,
+              SUM(CASE WHEN tcp_ok=0 THEN 1 ELSE 0 END) AS tcp_fail,
+              SUM(
+                CASE
+                  WHEN tcp_ok=1 AND latency_ms IS NOT NULL THEN latency_ms
+                  ELSE 0
+                END
+              ) AS ok_latency_sum_ms,
+              SUM(
+                CASE
+                  WHEN tcp_ok=1 AND latency_ms IS NOT NULL THEN 1
+                  ELSE 0
+                END
+              ) AS ok_latency_n,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL AND users_max IS NOT NULL THEN 1
+                  ELSE 0
+                END
+              ) AS status_samples,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                  THEN 1
+                  ELSE 0
+                END
+              ) AS status_samples_trusted,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                    AND users >= users_max
+                  THEN 1
+                  ELSE 0
+                END
+              ) AS full_trusted,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                  THEN users
+                  ELSE 0
+                END
+              ) AS users_sum_trusted,
+              SUM(
+                CASE
+                  WHEN users IS NOT NULL
+                    AND users_max IS NOT NULL
+                    AND users_max <= ?
+                  THEN users_max
+                  ELSE 0
+                END
+              ) AS users_max_sum_trusted
+            FROM scan_history
+            WHERE ts >= ?
+            GROUP BY day, server
+            """,
+            (max_trusted, max_trusted, max_trusted, max_trusted, cutoff_ts),
+        ).fetchall()
+        if not rows:
+            return 0
+
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO scan_daily(
+                  day,
+                  server,
+                  scans,
+                  tcp_ok,
+                  tcp_fail,
+                  ok_latency_sum_ms,
+                  ok_latency_n,
+                  status_samples,
+                  status_samples_trusted,
+                  full_trusted,
+                  users_sum_trusted,
+                  users_max_sum_trusted,
+                  updated_ts
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day, server) DO UPDATE SET
+                  scans=excluded.scans,
+                  tcp_ok=excluded.tcp_ok,
+                  tcp_fail=excluded.tcp_fail,
+                  ok_latency_sum_ms=excluded.ok_latency_sum_ms,
+                  ok_latency_n=excluded.ok_latency_n,
+                  status_samples=excluded.status_samples,
+                  status_samples_trusted=excluded.status_samples_trusted,
+                  full_trusted=excluded.full_trusted,
+                  users_sum_trusted=excluded.users_sum_trusted,
+                  users_max_sum_trusted=excluded.users_max_sum_trusted,
+                  updated_ts=excluded.updated_ts
+                """,
+                (
+                    str(r["day"]),
+                    str(r["server"]),
+                    int(r["scans"] or 0),
+                    int(r["tcp_ok"] or 0),
+                    int(r["tcp_fail"] or 0),
+                    float(r["ok_latency_sum_ms"] or 0.0),
+                    int(r["ok_latency_n"] or 0),
+                    int(r["status_samples"] or 0),
+                    int(r["status_samples_trusted"] or 0),
+                    int(r["full_trusted"] or 0),
+                    int(r["users_sum_trusted"] or 0),
+                    int(r["users_max_sum_trusted"] or 0),
+                    int(now_ts),
+                ),
+            )
+        self._conn.commit()
+        return int(len(rows))
+
+    def list_scan_daily(
+        self,
+        server: str,
+        *,
+        limit: int = 60,
+    ) -> list[KiwiScanDailyRow]:
+        text = str(server).strip()
+        if not text:
+            return []
+        lim = max(1, int(limit))
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT
+              day,
+              server,
+              scans,
+              tcp_ok,
+              tcp_fail,
+              ok_latency_sum_ms,
+              ok_latency_n,
+              status_samples,
+              status_samples_trusted,
+              full_trusted,
+              users_sum_trusted,
+              users_max_sum_trusted,
+              updated_ts
+            FROM scan_daily
+            WHERE server=?
+            ORDER BY day DESC
+            LIMIT ?
+            """,
+            (text, lim),
+        ).fetchall()
+        out: list[KiwiScanDailyRow] = []
+        for r in rows:
+            out.append(
+                KiwiScanDailyRow(
+                    day=str(r["day"]),
+                    server=str(r["server"]),
+                    scans=int(r["scans"]),
+                    tcp_ok=int(r["tcp_ok"]),
+                    tcp_fail=int(r["tcp_fail"]),
+                    ok_latency_sum_ms=float(r["ok_latency_sum_ms"] or 0.0),
+                    ok_latency_n=int(r["ok_latency_n"] or 0),
+                    status_samples=int(r["status_samples"] or 0),
+                    status_samples_trusted=int(r["status_samples_trusted"] or 0),
+                    full_trusted=int(r["full_trusted"] or 0),
+                    users_sum_trusted=int(r["users_sum_trusted"] or 0),
+                    users_max_sum_trusted=int(r["users_max_sum_trusted"] or 0),
+                    updated_ts=int(r["updated_ts"]),
+                )
+            )
+        return out
+
+    def get_last_seen_ts(self, server: str) -> int | None:
+        text = str(server).strip()
+        if not text:
+            return None
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT last_seen_ts FROM sources WHERE server=?",
+            (text,),
+        ).fetchone()
+        if row is None or row["last_seen_ts"] is None:
+            return None
+        return int(row["last_seen_ts"])
+
+    def get_schedule(
+        self,
+        server: str,
+    ) -> tuple[int | None, int | None, int]:
+        text = str(server).strip()
+        if not text:
+            return None, None, 0
+        cur = self._conn.cursor()
+        row = cur.execute(
+            """
+            SELECT cooldown_until_ts, next_probe_ts, backoff_level
+            FROM sources
+            WHERE server=?
+            """,
+            (text,),
+        ).fetchone()
+        if row is None:
+            return None, None, 0
+        cooldown = int(row["cooldown_until_ts"]) if row["cooldown_until_ts"] else None
+        next_probe = int(row["next_probe_ts"]) if row["next_probe_ts"] else None
+        backoff = int(row["backoff_level"] or 0)
+        return cooldown, next_probe, backoff
+
+    def is_due(self, server: str, *, now_ts: int | None = None) -> bool:
+        now = _now_ts() if now_ts is None else int(now_ts)
+        cooldown, next_probe, _backoff = self.get_schedule(server)
+        if cooldown is not None and cooldown > now:
+            return False
+        if next_probe is not None and next_probe > now:
+            return False
+        return True
+
+    @staticmethod
+    def _day_key(ts: int) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
+
+    def get_daily_probe_budget(
+        self,
+        *,
+        now_ts: int | None = None,
+        cap: int | None = None,
+    ) -> tuple[str, int, int]:
+        now = _now_ts() if now_ts is None else int(now_ts)
+        day = self._day_key(now)
+        cap_value = (
+            int(self._policy.daily_probe_cap) if cap is None else max(0, int(cap))
+        )
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT used, cap FROM probe_budget_day WHERE day=?",
+            (day,),
+        ).fetchone()
+        if row is None:
+            return day, 0, cap_value
+        used = int(row["used"])
+        current_cap = int(row["cap"])
+        return day, used, cap_value if cap is not None else current_cap
+
+    def reserve_daily_probe_budget(
+        self,
+        requested: int,
+        *,
+        now_ts: int | None = None,
+        cap: int | None = None,
+    ) -> tuple[int, str, int, int]:
+        now = _now_ts() if now_ts is None else int(now_ts)
+        day = self._day_key(now)
+        req = max(0, int(requested))
+        cap_value = (
+            int(self._policy.daily_probe_cap) if cap is None else max(0, int(cap))
+        )
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO probe_budget_day(day, used, cap, updated_ts)
+            VALUES(?, 0, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET
+              cap=excluded.cap,
+              updated_ts=excluded.updated_ts
+            """,
+            (day, cap_value, now),
+        )
+        row = cur.execute(
+            "SELECT used, cap FROM probe_budget_day WHERE day=?",
+            (day,),
+        ).fetchone()
+        used = int(row["used"]) if row is not None else 0
+        cap_db = int(row["cap"]) if row is not None else cap_value
+        remaining = max(0, cap_db - used)
+        allowed = min(req, remaining)
+        if allowed > 0:
+            cur.execute(
+                """
+                UPDATE probe_budget_day
+                SET used=?, updated_ts=?
+                WHERE day=?
+                """,
+                (used + allowed, now, day),
+            )
+            self._conn.commit()
+            return allowed, day, used + allowed, cap_db
+        self._conn.commit()
+        return 0, day, used, cap_db
+
+    def _stable_jitter_seconds(
+        self,
+        *,
+        server: str,
+        seed_ts: int,
+        jitter_max_seconds: int,
+    ) -> int:
+        lim = max(0, int(jitter_max_seconds))
+        if lim <= 0:
+            return 0
+        raw = hashlib.sha256(f"{server}:{seed_ts}".encode()).digest()
+        val = int.from_bytes(raw[:4], "big", signed=False)
+        span = lim * 2 + 1
+        return int(val % span) - lim
+
+    def _schedule_after_probe(
+        self,
+        *,
+        server: str,
+        now_ts: int,
+        success: bool,
+        prior_backoff_level: int,
+    ) -> tuple[int | None, int | None, int]:
+        min_interval_days = max(0, int(self._policy.scan_min_interval_days))
+        base_success = (
+            max(3600, min_interval_days * 86400) if min_interval_days > 0 else 3600
+        )
+        max_days = max(1, int(self._policy.invalid_ttl_days))
+        if success:
+            next_backoff = max(0, int(prior_backoff_level) - 1)
+            jitter = self._stable_jitter_seconds(
+                server=server,
+                seed_ts=now_ts,
+                jitter_max_seconds=min(3600, base_success // 10),
+            )
+            next_probe = now_ts + base_success + jitter
+            return None, int(next_probe), next_backoff
+
+        next_backoff = min(10, max(0, int(prior_backoff_level)) + 1)
+        base_fail = (
+            max(3600, min_interval_days * 86400) if min_interval_days > 0 else 3600
+        )
+        delay = min(max_days * 86400, base_fail * (2**next_backoff))
+        jitter = self._stable_jitter_seconds(
+            server=server,
+            seed_ts=now_ts,
+            jitter_max_seconds=min(3600, delay // 10),
+        )
+        until = now_ts + delay + jitter
+        return int(until), int(until), next_backoff
 
     def _get_source_counters(
         self,
@@ -340,6 +1142,7 @@ class KiwiSourceRegistry:
         result: KiwiReachabilityResult,
         *,
         max_total: int = 1000,
+        run_id: str | None = None,
     ) -> None:
         if not result.server.strip():
             return
@@ -353,27 +1156,49 @@ class KiwiSourceRegistry:
         cur.execute(
             """
             INSERT INTO scan_history(
+              run_id,
               ts,
               server,
               tcp_ok,
               latency_ms,
+              tcp_ms,
               http_status,
+              http_ok,
+              http_ms,
               kiwi_ts,
+              status_ok,
+              users,
+              users_max,
+              total_ms,
+              error_kind,
               error
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                str(run_id) if run_id else None,
                 ts,
                 result.server,
                 1 if result.tcp_ok else 0,
                 result.latency_ms,
+                result.tcp_ms,
                 result.http_status,
+                1 if result.http_ok else 0 if result.http_ok is False else None,
+                result.http_ms,
                 result.kiwi_ts,
+                1 if result.status_ok else 0 if result.status_ok is False else None,
+                result.users,
+                result.users_max,
+                result.total_ms,
+                result.error_kind,
                 result.error,
             ),
         )
 
+        enable_after_ok = bool(result.tcp_ok) and not self.is_blocked(
+            result.server,
+            kind="blacklist",
+        )
         (
             successes,
             failures,
@@ -401,6 +1226,16 @@ class KiwiSourceRegistry:
             monitor_reconnects=monitor_reconnects,
             monitor_switches=monitor_switches,
         )
+        _cooldown, _next_probe, prior_backoff = self.get_schedule(result.server)
+        cooldown_until_ts, next_probe_ts, backoff_level = self._schedule_after_probe(
+            server=result.server,
+            now_ts=ts,
+            success=bool(result.tcp_ok),
+            prior_backoff_level=int(prior_backoff),
+        )
+        status_ts = ts if bool(result.status_ok) else None
+        last_users = result.users
+        last_users_max = result.users_max
 
         cur.execute(
             """
@@ -415,7 +1250,14 @@ class KiwiSourceRegistry:
               last_http_status=?,
               last_kiwi_ts=?,
               last_error=?,
-              score=?
+              score=?,
+              cooldown_until_ts=?,
+              next_probe_ts=?,
+              backoff_level=?,
+              last_users=COALESCE(?, last_users),
+              last_users_max=COALESCE(?, last_users_max),
+              last_status_ts=COALESCE(?, last_status_ts),
+              enabled=CASE WHEN ? THEN 1 ELSE enabled END
             WHERE server=?
             """,
             (
@@ -430,6 +1272,13 @@ class KiwiSourceRegistry:
                 result.kiwi_ts,
                 result.error,
                 score,
+                cooldown_until_ts,
+                next_probe_ts,
+                int(backoff_level),
+                last_users,
+                last_users_max,
+                status_ts,
+                1 if enable_after_ok else 0,
                 result.server,
             ),
         )
@@ -444,6 +1293,7 @@ class KiwiSourceRegistry:
         results: Iterable[KiwiReachabilityResult],
         *,
         max_total: int = 1000,
+        run_id: str | None = None,
     ) -> tuple[int, int]:
         added = 0
         ts = _now_ts()
@@ -472,23 +1322,41 @@ class KiwiSourceRegistry:
             cur.execute(
                 """
                 INSERT INTO scan_history(
+                  run_id,
                   ts,
                   server,
                   tcp_ok,
                   latency_ms,
+                  tcp_ms,
                   http_status,
+                  http_ok,
+                  http_ms,
                   kiwi_ts,
+                  status_ok,
+                  users,
+                  users_max,
+                  total_ms,
+                  error_kind,
                   error
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    str(run_id) if run_id else None,
                     ts,
                     server,
                     1 if r.tcp_ok else 0,
                     r.latency_ms,
+                    r.tcp_ms,
                     r.http_status,
+                    1 if r.http_ok else 0 if r.http_ok is False else None,
+                    r.http_ms,
                     r.kiwi_ts,
+                    1 if r.status_ok else 0 if r.status_ok is False else None,
+                    r.users,
+                    r.users_max,
+                    r.total_ms,
+                    r.error_kind,
                     r.error,
                 ),
             )
@@ -500,7 +1368,8 @@ class KiwiSourceRegistry:
                   failures,
                   consecutive_failures,
                   monitor_reconnects,
-                  monitor_switches
+                  monitor_switches,
+                  backoff_level
                 FROM sources
                 WHERE server=?
                 """,
@@ -514,6 +1383,7 @@ class KiwiSourceRegistry:
             consecutive = int(row["consecutive_failures"])
             monitor_reconnects = int(row["monitor_reconnects"])
             monitor_switches = int(row["monitor_switches"])
+            prior_backoff = int(row["backoff_level"] or 0)
 
             if r.tcp_ok:
                 successes += 1
@@ -526,6 +1396,10 @@ class KiwiSourceRegistry:
                 last_ok_ts = None
                 last_fail_ts = ts
 
+            enable_after_ok = bool(r.tcp_ok) and not self.is_blocked(
+                server,
+                kind="blacklist",
+            )
             score = compute_source_score(
                 successes=successes,
                 failures=failures,
@@ -533,6 +1407,19 @@ class KiwiSourceRegistry:
                 monitor_reconnects=monitor_reconnects,
                 monitor_switches=monitor_switches,
             )
+            (
+                cooldown_until_ts,
+                next_probe_ts,
+                backoff_level,
+            ) = self._schedule_after_probe(
+                server=server,
+                now_ts=ts,
+                success=bool(r.tcp_ok),
+                prior_backoff_level=prior_backoff,
+            )
+            status_ts = ts if bool(r.status_ok) else None
+            last_users = r.users
+            last_users_max = r.users_max
 
             cur.execute(
                 """
@@ -547,7 +1434,14 @@ class KiwiSourceRegistry:
                   last_http_status=?,
                   last_kiwi_ts=?,
                   last_error=?,
-                  score=?
+                  score=?,
+                  cooldown_until_ts=?,
+                  next_probe_ts=?,
+                  backoff_level=?,
+                  last_users=COALESCE(?, last_users),
+                  last_users_max=COALESCE(?, last_users_max),
+                  last_status_ts=COALESCE(?, last_status_ts),
+                  enabled=CASE WHEN ? THEN 1 ELSE enabled END
                 WHERE server=?
                 """,
                 (
@@ -562,6 +1456,13 @@ class KiwiSourceRegistry:
                     r.kiwi_ts,
                     r.error,
                     score,
+                    cooldown_until_ts,
+                    next_probe_ts,
+                    int(backoff_level),
+                    last_users,
+                    last_users_max,
+                    status_ts,
+                    1 if enable_after_ok else 0,
                     server,
                 ),
             )
@@ -646,6 +1547,48 @@ class KiwiSourceRegistry:
         )
         self.prune(max_total=total_limit)
 
+    def record_audio_health(
+        self,
+        *,
+        server: str,
+        ok: bool,
+        max_total: int = 1000,
+    ) -> None:
+        text = str(server).strip()
+        if not text:
+            return
+        try:
+            parse_kiwi_server_address(text)
+        except Exception:
+            return
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        self._upsert_source_cur(cur, text, ts)
+        if bool(ok):
+            cur.execute(
+                """
+                UPDATE sources SET
+                  last_audio_ok_ts=COALESCE(?, last_audio_ok_ts)
+                WHERE server=?
+                """,
+                (ts, text),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE sources SET
+                  last_audio_fail_ts=COALESCE(?, last_audio_fail_ts),
+                  audio_dropouts=audio_dropouts + 1
+                WHERE server=?
+                """,
+                (ts, text),
+            )
+        self._conn.commit()
+        total_limit = (
+            int(self._policy.max_total) if max_total == 1000 else int(max_total)
+        )
+        self.prune(max_total=total_limit)
+
     def list_history(
         self,
         server: str,
@@ -659,7 +1602,22 @@ class KiwiSourceRegistry:
         cur = self._conn.cursor()
         rows = cur.execute(
             """
-            SELECT ts, tcp_ok, latency_ms, http_status, kiwi_ts, error
+            SELECT
+              ts,
+              tcp_ok,
+              latency_ms,
+              tcp_ms,
+              http_status,
+              http_ok,
+              http_ms,
+              kiwi_ts,
+              status_ok,
+              users,
+              users_max,
+              total_ms,
+              error_kind,
+              run_id,
+              error
             FROM scan_history
             WHERE server=?
             ORDER BY ts DESC, id DESC
@@ -676,10 +1634,31 @@ class KiwiSourceRegistry:
                     latency_ms=(
                         float(r["latency_ms"]) if r["latency_ms"] is not None else None
                     ),
+                    tcp_ms=float(r["tcp_ms"]) if r["tcp_ms"] is not None else None,
                     http_status=(
                         int(r["http_status"]) if r["http_status"] is not None else None
                     ),
+                    http_ok=(
+                        bool(int(r["http_ok"])) if r["http_ok"] is not None else None
+                    ),
+                    http_ms=float(r["http_ms"]) if r["http_ms"] is not None else None,
                     kiwi_ts=int(r["kiwi_ts"]) if r["kiwi_ts"] is not None else None,
+                    status_ok=(
+                        bool(int(r["status_ok"]))
+                        if r["status_ok"] is not None
+                        else None
+                    ),
+                    users=int(r["users"]) if r["users"] is not None else None,
+                    users_max=(
+                        int(r["users_max"]) if r["users_max"] is not None else None
+                    ),
+                    total_ms=(
+                        float(r["total_ms"]) if r["total_ms"] is not None else None
+                    ),
+                    error_kind=(
+                        str(r["error_kind"]) if r["error_kind"] is not None else None
+                    ),
+                    run_id=str(r["run_id"]) if r["run_id"] is not None else None,
                     error=str(r["error"]) if r["error"] is not None else None,
                 )
             )
@@ -704,7 +1683,12 @@ class KiwiSourceRegistry:
                   failures,
                   consecutive_failures,
                   last_latency_ms,
-                  last_seen_ts
+                  last_seen_ts,
+                  last_users,
+                  last_users_max,
+                  last_status_ts,
+                  last_audio_ok_ts,
+                  audio_dropouts
                 FROM sources
                 WHERE enabled=1
                 ORDER BY score DESC, successes DESC, failures ASC, server ASC
@@ -723,7 +1707,12 @@ class KiwiSourceRegistry:
                   failures,
                   consecutive_failures,
                   last_latency_ms,
-                  last_seen_ts
+                  last_seen_ts,
+                  last_users,
+                  last_users_max,
+                  last_status_ts,
+                  last_audio_ok_ts,
+                  audio_dropouts
                 FROM sources
                 ORDER BY
                   enabled DESC,
@@ -755,6 +1744,25 @@ class KiwiSourceRegistry:
                         if r["last_seen_ts"] is not None
                         else None
                     ),
+                    last_users=(
+                        int(r["last_users"]) if r["last_users"] is not None else None
+                    ),
+                    last_users_max=(
+                        int(r["last_users_max"])
+                        if r["last_users_max"] is not None
+                        else None
+                    ),
+                    last_status_ts=(
+                        int(r["last_status_ts"])
+                        if r["last_status_ts"] is not None
+                        else None
+                    ),
+                    last_audio_ok_ts=(
+                        int(r["last_audio_ok_ts"])
+                        if r["last_audio_ok_ts"] is not None
+                        else None
+                    ),
+                    audio_dropouts=int(r["audio_dropouts"] or 0),
                 )
             )
         return out
@@ -782,7 +1790,21 @@ class KiwiSourceRegistry:
         min_samples = int(self._policy.prune_disable_min_samples)
         min_ratio = float(self._policy.prune_disable_min_success_ratio)
         cur = self._conn.cursor()
+        now_ts = _now_ts()
+        self._expire_blocks_cur(cur, now_ts=now_ts)
 
+        to_disable_rows = cur.execute(
+            """
+            SELECT server
+            FROM sources
+            WHERE enabled=1
+              AND consecutive_failures >= ?
+              AND (successes + failures) >= ?
+              AND (CAST(successes AS REAL) / NULLIF(successes + failures, 0)) < ?
+            """,
+            (cf, min_samples, min_ratio),
+        ).fetchall()
+        to_disable = [str(r["server"]) for r in to_disable_rows]
         disabled = cur.execute(
             """
             UPDATE sources SET enabled=0
@@ -793,6 +1815,38 @@ class KiwiSourceRegistry:
             """,
             (cf, min_samples, min_ratio),
         ).rowcount
+        invalid_days = max(0, int(self._policy.invalid_ttl_days))
+        if to_disable and invalid_days > 0:
+            expires_ts = now_ts + invalid_days * 86400
+            for server in to_disable:
+                if self.is_blocked(server, kind="blacklist"):
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO blocked_sources(
+                      server,
+                      kind,
+                      first_ts,
+                      last_ts,
+                      expires_ts,
+                      hits,
+                      reason
+                    )
+                    VALUES(?, 'invalid', ?, ?, ?, 1, ?)
+                    ON CONFLICT(server, kind) DO UPDATE SET
+                      last_ts=excluded.last_ts,
+                      expires_ts=excluded.expires_ts,
+                      hits=blocked_sources.hits + 1,
+                      reason=COALESCE(excluded.reason, blocked_sources.reason)
+                    """,
+                    (
+                        server,
+                        now_ts,
+                        now_ts,
+                        int(expires_ts),
+                        "auto-prune",
+                    ),
+                )
 
         total = cur.execute("SELECT COUNT(1) AS n FROM sources").fetchone()
         n_total = int(total["n"]) if total is not None else 0
@@ -818,6 +1872,38 @@ class KiwiSourceRegistry:
                 cur.execute(
                     f"DELETE FROM sources WHERE server IN ({placeholders})",
                     tuple(servers),
+                )
+
+        stale_days = max(0, int(self._policy.stale_delete_days))
+        if stale_days > 0:
+            cutoff = now_ts - stale_days * 86400
+            stale = cur.execute(
+                """
+                SELECT server FROM sources
+                WHERE enabled=0
+                  AND last_seen_ts IS NOT NULL
+                  AND last_seen_ts < ?
+                """,
+                (int(cutoff),),
+            ).fetchall()
+            stale_servers = [str(r["server"]) for r in stale]
+            if stale_servers:
+                placeholders = ",".join(["?"] * len(stale_servers))
+                cur.execute(
+                    f"DELETE FROM scan_history WHERE server IN ({placeholders})",
+                    tuple(stale_servers),
+                )
+                cur.execute(
+                    f"DELETE FROM monitor_events WHERE server IN ({placeholders})",
+                    tuple(stale_servers),
+                )
+                cur.execute(
+                    f"DELETE FROM blocked_sources WHERE server IN ({placeholders})",
+                    tuple(stale_servers),
+                )
+                cur.execute(
+                    f"DELETE FROM sources WHERE server IN ({placeholders})",
+                    tuple(stale_servers),
                 )
         self._conn.commit()
         return int(disabled)

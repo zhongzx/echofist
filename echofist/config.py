@@ -29,10 +29,23 @@ class KiwiSourcePolicyConfig(BaseModel):
     """Kiwi 源注册表策略配置"""
 
     daily_fetch_cap: int = Field(50, description="每日/单次引入新源上限")
+    daily_probe_cap: int = Field(200, description="每日探测上限（礼貌预算）")
     max_total: int = Field(1000, description="注册表总量上限")
     prune_disable_consecutive_failures: int = Field(8, description="禁用连败阈值")
     prune_disable_min_samples: int = Field(12, description="禁用最小样本数")
     prune_disable_min_success_ratio: float = Field(0.25, description="禁用最小成功率")
+    scan_min_interval_days: int = Field(
+        1,
+        description="同一源最小复检间隔（天，避免同日重复探测）",
+    )
+    invalid_ttl_days: int = Field(
+        14,
+        description="自动失效名单保留时长（天，过期后允许重新探测）",
+    )
+    stale_delete_days: int = Field(
+        180,
+        description="长期不活跃源清理阈值（天，仅对已禁用源生效）",
+    )
 
 
 class MorseDecoderConfig(BaseModel):

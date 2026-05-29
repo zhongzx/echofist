@@ -3,6 +3,8 @@ KiwiSDR 客户端模块 - 支持全球 700+ 远程接收机接入
 """
 
 import asyncio
+import json
+import socket
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -38,8 +40,17 @@ class KiwiReachabilityResult:
     port: int
     tcp_ok: bool
     latency_ms: float | None
+    tcp_ms: float | None
     http_status: int | None
+    http_ok: bool | None
+    http_ms: float | None
     kiwi_ts: int | None
+    status_ok: bool | None
+    status_ms: float | None
+    users: int | None
+    users_max: int | None
+    total_ms: float | None
+    error_kind: str | None
     error: str | None
 
 
@@ -71,28 +82,30 @@ def parse_kiwi_server_address(server: str) -> tuple[str, int]:
     return host, port
 
 
-async def check_kiwi_reachability(
-    server: str,
-    *,
-    timeout_seconds: float = 1.2,
-    verify_http: bool = True,
-) -> KiwiReachabilityResult:
-    host: str
-    port: int
-    try:
-        host, port = parse_kiwi_server_address(server)
-    except Exception as e:
-        return KiwiReachabilityResult(
-            server=server,
-            host="",
-            port=0,
-            tcp_ok=False,
-            latency_ms=None,
-            http_status=None,
-            kiwi_ts=None,
-            error=str(e),
-        )
+def _classify_network_error(e: BaseException) -> str:
+    if isinstance(e, ValueError):
+        return "invalid_address"
+    if isinstance(e, asyncio.TimeoutError):
+        return "timeout"
+    if isinstance(e, socket.gaierror):
+        return "dns_error"
+    if isinstance(e, ConnectionRefusedError):
+        return "tcp_refused"
+    if isinstance(e, ConnectionResetError):
+        return "tcp_reset"
+    if isinstance(e, OSError):
+        if e.errno in {54, 60, 61}:
+            return "os_error"
+        return "os_error"
+    return "unknown_error"
 
+
+async def _probe_tcp(
+    host: str,
+    port: int,
+    *,
+    timeout_seconds: float,
+) -> tuple[bool, float | None, str | None, str | None]:
     start = time.monotonic()
     try:
         _reader, writer = await asyncio.wait_for(
@@ -105,47 +118,194 @@ async def check_kiwi_reachability(
         except Exception:
             pass
     except Exception as e:
+        return False, None, _classify_network_error(e), str(e)
+    tcp_ms = (time.monotonic() - start) * 1000.0
+    return True, float(tcp_ms), None, None
+
+
+async def _fetch_ver(
+    session: aiohttp.ClientSession,
+    host: str,
+    port: int,
+) -> tuple[
+    int | None,
+    bool | None,
+    float | None,
+    int | None,
+    str | None,
+    str | None,
+]:
+    start = time.monotonic()
+    url = f"http://{host}:{port}/VER"
+    http_status: int | None = None
+    http_ok: bool | None = None
+    kiwi_ts: int | None = None
+    error_kind: str | None = None
+    http_error: str | None = None
+    try:
+        async with session.get(url) as resp:
+            http_status = int(resp.status)
+            http_ok = http_status == 200
+            if http_ok:
+                try:
+                    text = await resp.text(errors="replace")
+                    data: Any = json.loads(text)
+                    ts = data.get("ts") if isinstance(data, dict) else None
+                    if isinstance(ts, int):
+                        kiwi_ts = ts
+                    elif isinstance(ts, float):
+                        kiwi_ts = int(ts)
+                except Exception:
+                    kiwi_ts = None
+            else:
+                error_kind = "http_bad_status"
+    except Exception as e:
+        http_error = str(e)
+        http_ok = False
+        http_status = None
+        kind = _classify_network_error(e)
+        error_kind = "http_timeout" if kind == "timeout" else "http_error"
+    http_ms = (time.monotonic() - start) * 1000.0
+    return http_status, http_ok, float(http_ms), kiwi_ts, error_kind, http_error
+
+
+async def _fetch_status(
+    session: aiohttp.ClientSession,
+    host: str,
+    port: int,
+) -> tuple[bool | None, float | None, int | None, int | None]:
+    start = time.monotonic()
+    url = f"http://{host}:{port}/status"
+    status_ok: bool | None = None
+    users: int | None = None
+    users_max: int | None = None
+    try:
+        async with session.get(url) as resp:
+            status_ok = int(resp.status) == 200
+            if status_ok:
+                text = await resp.text(errors="replace")
+                values = _parse_kiwi_status(text)
+                users = values.get("users")
+                users_max = values.get("users_max")
+    except Exception:
+        status_ok = False
+    status_ms = (time.monotonic() - start) * 1000.0
+    return status_ok, float(status_ms), users, users_max
+
+
+async def check_kiwi_reachability(
+    server: str,
+    *,
+    timeout_seconds: float = 1.2,
+    verify_http: bool = True,
+    fetch_status: bool = False,
+) -> KiwiReachabilityResult:
+    host: str
+    port: int
+    try:
+        host, port = parse_kiwi_server_address(server)
+    except Exception as e:
+        return KiwiReachabilityResult(
+            server=server,
+            host="",
+            port=0,
+            tcp_ok=False,
+            latency_ms=None,
+            tcp_ms=None,
+            http_status=None,
+            http_ok=None,
+            http_ms=None,
+            kiwi_ts=None,
+            status_ok=None,
+            status_ms=None,
+            users=None,
+            users_max=None,
+            total_ms=None,
+            error_kind=_classify_network_error(e),
+            error=str(e),
+        )
+
+    start_total = time.monotonic()
+    tcp_ok, tcp_ms, tcp_error_kind, tcp_error = await _probe_tcp(
+        host,
+        port,
+        timeout_seconds=float(timeout_seconds),
+    )
+    if not tcp_ok:
+        total_ms = (time.monotonic() - start_total) * 1000.0
         return KiwiReachabilityResult(
             server=server,
             host=host,
             port=port,
             tcp_ok=False,
             latency_ms=None,
+            tcp_ms=None,
             http_status=None,
+            http_ok=None,
+            http_ms=None,
             kiwi_ts=None,
-            error=str(e),
+            status_ok=None,
+            status_ms=None,
+            users=None,
+            users_max=None,
+            total_ms=total_ms,
+            error_kind=tcp_error_kind,
+            error=tcp_error,
         )
 
-    latency_ms = (time.monotonic() - start) * 1000.0
+    latency_ms = float(tcp_ms or 0.0)
     http_status: int | None = None
+    http_ok: bool | None = None
     kiwi_ts: int | None = None
     http_error: str | None = None
+    http_ms: float | None = None
+    error_kind: str | None = None
+    status_ok: bool | None = None
+    status_ms: float | None = None
+    users: int | None = None
+    users_max: int | None = None
 
-    if verify_http:
-        url = f"http://{host}:{port}/VER"
+    if verify_http or fetch_status:
         timeout = aiohttp.ClientTimeout(total=float(timeout_seconds))
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                async with session.get(url) as resp:
-                    http_status = int(resp.status)
-                    if http_status == 200:
-                        data: Any = await resp.json()
-                        ts = data.get("ts") if isinstance(data, dict) else None
-                        if isinstance(ts, int):
-                            kiwi_ts = ts
-                        elif isinstance(ts, float):
-                            kiwi_ts = int(ts)
-            except Exception as e:
-                http_error = str(e)
+            if verify_http:
+                (
+                    http_status,
+                    http_ok,
+                    http_ms,
+                    kiwi_ts,
+                    error_kind,
+                    http_error,
+                ) = await _fetch_ver(
+                    session,
+                    host,
+                    port,
+                )
+            if fetch_status:
+                status_ok, status_ms, users, users_max = await _fetch_status(
+                    session,
+                    host,
+                    port,
+                )
 
+    total_ms = (time.monotonic() - start_total) * 1000.0
     return KiwiReachabilityResult(
         server=server,
         host=host,
         port=port,
         tcp_ok=True,
         latency_ms=latency_ms,
+        tcp_ms=float(tcp_ms) if tcp_ms is not None else None,
         http_status=http_status,
+        http_ok=http_ok,
+        http_ms=http_ms,
         kiwi_ts=kiwi_ts,
+        status_ok=status_ok,
+        status_ms=status_ms,
+        users=users,
+        users_max=users_max,
+        total_ms=total_ms,
+        error_kind=error_kind,
         error=http_error,
     )
 
@@ -156,6 +316,7 @@ async def scan_kiwi_reachability(
     concurrency: int = 5,
     timeout_seconds: float = 1.2,
     verify_http: bool = True,
+    fetch_status: bool = False,
 ) -> list[KiwiReachabilityResult]:
     limit = max(1, min(int(concurrency), 10))
     sem = asyncio.Semaphore(limit)
@@ -166,6 +327,7 @@ async def scan_kiwi_reachability(
                 server,
                 timeout_seconds=timeout_seconds,
                 verify_http=verify_http,
+                fetch_status=fetch_status,
             )
 
     tasks = [asyncio.create_task(run_one(s)) for s in servers]
@@ -173,6 +335,22 @@ async def scan_kiwi_reachability(
         return []
     results = await asyncio.gather(*tasks)
     return list(results)
+
+
+def _parse_kiwi_status(text: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for line in str(text).splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in {"users", "users_max"}:
+            continue
+        try:
+            out[key] = int(float(value.strip()))
+        except ValueError:
+            continue
+    return out
 
 
 class _ImaAdpcmDecoder:
@@ -559,8 +737,12 @@ class KiwiSDRClient:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         return int(time.time())
-                    data = await resp.json()
-                    ts = data.get("ts")
+                    try:
+                        text = await resp.text(errors="replace")
+                        data: Any = json.loads(text)
+                    except Exception:
+                        return int(time.time())
+                    ts = data.get("ts") if isinstance(data, dict) else None
                     if isinstance(ts, int):
                         return ts
                     if isinstance(ts, float):
