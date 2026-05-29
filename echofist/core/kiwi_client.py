@@ -3,6 +3,7 @@ KiwiSDR 客户端模块 - 支持全球 700+ 远程接收机接入
 """
 
 import asyncio
+import socket
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -38,8 +39,13 @@ class KiwiReachabilityResult:
     port: int
     tcp_ok: bool
     latency_ms: float | None
+    tcp_ms: float | None
     http_status: int | None
+    http_ok: bool | None
+    http_ms: float | None
     kiwi_ts: int | None
+    total_ms: float | None
+    error_kind: str | None
     error: str | None
 
 
@@ -71,6 +77,24 @@ def parse_kiwi_server_address(server: str) -> tuple[str, int]:
     return host, port
 
 
+def _classify_network_error(e: BaseException) -> str:
+    if isinstance(e, ValueError):
+        return "invalid_address"
+    if isinstance(e, asyncio.TimeoutError):
+        return "timeout"
+    if isinstance(e, socket.gaierror):
+        return "dns_error"
+    if isinstance(e, ConnectionRefusedError):
+        return "tcp_refused"
+    if isinstance(e, ConnectionResetError):
+        return "tcp_reset"
+    if isinstance(e, OSError):
+        if e.errno in {54, 60, 61}:
+            return "os_error"
+        return "os_error"
+    return "unknown_error"
+
+
 async def check_kiwi_reachability(
     server: str,
     *,
@@ -88,12 +112,18 @@ async def check_kiwi_reachability(
             port=0,
             tcp_ok=False,
             latency_ms=None,
+            tcp_ms=None,
             http_status=None,
+            http_ok=None,
+            http_ms=None,
             kiwi_ts=None,
+            total_ms=None,
+            error_kind=_classify_network_error(e),
             error=str(e),
         )
 
-    start = time.monotonic()
+    start_total = time.monotonic()
+    start_tcp = start_total
     try:
         _reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
@@ -105,47 +135,77 @@ async def check_kiwi_reachability(
         except Exception:
             pass
     except Exception as e:
+        total_ms = (time.monotonic() - start_total) * 1000.0
         return KiwiReachabilityResult(
             server=server,
             host=host,
             port=port,
             tcp_ok=False,
             latency_ms=None,
+            tcp_ms=None,
             http_status=None,
+            http_ok=None,
+            http_ms=None,
             kiwi_ts=None,
+            total_ms=total_ms,
+            error_kind=_classify_network_error(e),
             error=str(e),
         )
 
-    latency_ms = (time.monotonic() - start) * 1000.0
+    tcp_ms = (time.monotonic() - start_tcp) * 1000.0
+    latency_ms = float(tcp_ms)
     http_status: int | None = None
+    http_ok: bool | None = None
     kiwi_ts: int | None = None
     http_error: str | None = None
+    http_ms: float | None = None
+    error_kind: str | None = None
 
     if verify_http:
+        start_http = time.monotonic()
         url = f"http://{host}:{port}/VER"
         timeout = aiohttp.ClientTimeout(total=float(timeout_seconds))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.get(url) as resp:
                     http_status = int(resp.status)
-                    if http_status == 200:
-                        data: Any = await resp.json()
-                        ts = data.get("ts") if isinstance(data, dict) else None
-                        if isinstance(ts, int):
-                            kiwi_ts = ts
-                        elif isinstance(ts, float):
-                            kiwi_ts = int(ts)
+                    http_ok = http_status == 200
+                    if http_ok:
+                        try:
+                            data: Any = await resp.json()
+                            ts = data.get("ts") if isinstance(data, dict) else None
+                            if isinstance(ts, int):
+                                kiwi_ts = ts
+                            elif isinstance(ts, float):
+                                kiwi_ts = int(ts)
+                        except Exception as e:
+                            http_ok = False
+                            error_kind = "http_parse_error"
+                            http_error = str(e)
+                    else:
+                        error_kind = "http_bad_status"
             except Exception as e:
                 http_error = str(e)
+                http_ok = False
+                kind = _classify_network_error(e)
+                error_kind = "http_timeout" if kind == "timeout" else "http_error"
+            finally:
+                http_ms = (time.monotonic() - start_http) * 1000.0
 
+    total_ms = (time.monotonic() - start_total) * 1000.0
     return KiwiReachabilityResult(
         server=server,
         host=host,
         port=port,
         tcp_ok=True,
         latency_ms=latency_ms,
+        tcp_ms=tcp_ms,
         http_status=http_status,
+        http_ok=http_ok,
+        http_ms=http_ms,
         kiwi_ts=kiwi_ts,
+        total_ms=total_ms,
+        error_kind=error_kind,
         error=http_error,
     )
 

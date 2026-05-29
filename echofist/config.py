@@ -33,6 +33,18 @@ class KiwiSourcePolicyConfig(BaseModel):
     prune_disable_consecutive_failures: int = Field(8, description="禁用连败阈值")
     prune_disable_min_samples: int = Field(12, description="禁用最小样本数")
     prune_disable_min_success_ratio: float = Field(0.25, description="禁用最小成功率")
+    scan_min_interval_days: int = Field(
+        1,
+        description="同一源最小复检间隔（天，避免同日重复探测）",
+    )
+    invalid_ttl_days: int = Field(
+        14,
+        description="自动失效名单保留时长（天，过期后允许重新探测）",
+    )
+    stale_delete_days: int = Field(
+        180,
+        description="长期不活跃源清理阈值（天，仅对已禁用源生效）",
+    )
 
 
 class MorseDecoderConfig(BaseModel):
