@@ -29,6 +29,7 @@ class KiwiSourcePolicyConfig(BaseModel):
     """Kiwi 源注册表策略配置"""
 
     daily_fetch_cap: int = Field(50, description="每日/单次引入新源上限")
+    daily_probe_cap: int = Field(200, description="每日探测上限（礼貌预算）")
     max_total: int = Field(1000, description="注册表总量上限")
     prune_disable_consecutive_failures: int = Field(8, description="禁用连败阈值")
     prune_disable_min_samples: int = Field(12, description="禁用最小样本数")

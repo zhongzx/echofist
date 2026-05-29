@@ -1053,6 +1053,8 @@ async def monitor_mode(
     last_good_audio_at = time.monotonic()
     last_switch_at = time.monotonic()
     server_fail_until: dict[str, float] = {}
+    last_audio_ok_recorded_at = 0.0
+    audio_ok_record_interval_seconds = 20.0
 
     try:
         app_config = load_config()
@@ -1185,6 +1187,18 @@ async def monitor_mode(
                 if audio_age < 0.5:
                     last_good_audio_at = time.monotonic()
                     consecutive_reconnects = 0
+                    if registry is not None:
+                        mono_now = time.monotonic()
+                        if (
+                            mono_now - last_audio_ok_recorded_at
+                            >= audio_ok_record_interval_seconds
+                        ):
+                            registry.record_audio_health(
+                                server=current_server,
+                                ok=True,
+                                max_total=max_store,
+                            )
+                            last_audio_ok_recorded_at = mono_now
                 dt = now - window_start
                 if dt >= 1.0:
                     chunks_rate = window_chunks / dt
@@ -1226,6 +1240,12 @@ async def monitor_mode(
                         layout["status"].update(dashboard.render_status())
                         if player is not None:
                             player.clear()
+                        if registry is not None:
+                            registry.record_audio_health(
+                                server=old_server,
+                                ok=False,
+                                max_total=max_store,
+                            )
                         try:
                             await client.disconnect()
                         except Exception:
@@ -1330,6 +1350,12 @@ async def monitor_mode(
                             layout["status"].update(dashboard.render_status())
                             if player is not None:
                                 player.clear()
+                            if registry is not None:
+                                registry.record_audio_health(
+                                    server=current_server,
+                                    ok=False,
+                                    max_total=max_store,
+                                )
                             if registry is not None:
                                 registry.record_monitor_event(
                                     server=current_server,

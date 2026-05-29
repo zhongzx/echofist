@@ -157,3 +157,28 @@ KiwiSDR（含 KiwiSDR 2）更像“网络版短波接收机服务器”：把本
 
 - `/VER` 在实测中表现为“body 是 JSON，但 mimetype 不是 application/json”，因此解析应采用“最佳努力”，不要把 mimetype 不匹配视为失败。
 - `min` 可用于粗粒度区分软件版本（例如 840/841），但不应作为淘汰硬条件。
+
+## 10. 阶段 1 落地说明（礼貌调度与退避）
+
+阶段 1 的目标是把“慢扫策略”固化为**可持久化状态**，避免每次运行都像失忆扫描。
+
+### 10.1 sources 新增调度字段
+
+- `cooldown_until_ts`：该源冷却截止时间（未到期时不探测）
+- `next_probe_ts`：该源下次计划探测时间（未到期时不探测）
+- `backoff_level`：退避等级（失败升级、成功回退）
+
+### 10.2 全局日预算
+
+新增表：`probe_budget_day(day, used, cap, updated_ts)`，用于控制每日探测总量（礼貌预算）。
+
+默认预算来自配置：`kiwi_sources.daily_probe_cap`。
+
+### 10.3 抖动策略
+
+对 `next_probe_ts`/`cooldown_until_ts` 增加稳定抖动（与 server+seed_ts 相关），避免大量源在同一时刻形成固定节奏。
+
+### 10.4 seed 脚本相关参数
+
+- `--daily-cap N`：覆盖默认每日探测上限
+- `--ignore-daily-budget`：忽略预算（仅建议用于离线/沙盒验证）

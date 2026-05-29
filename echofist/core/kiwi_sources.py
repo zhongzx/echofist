@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import sqlite3
@@ -104,6 +105,11 @@ class KiwiSourceSummary:
     consecutive_failures: int
     last_latency_ms: float | None
     last_seen_ts: int | None
+    last_users: int | None
+    last_users_max: int | None
+    last_status_ts: int | None
+    last_audio_ok_ts: int | None
+    audio_dropouts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +265,16 @@ class KiwiSourceRegistry:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS probe_budget_day (
+              day TEXT PRIMARY KEY,
+              used INTEGER NOT NULL,
+              cap INTEGER NOT NULL,
+              updated_ts INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_history_server_ts
             ON scan_history(server, ts)
             """
@@ -273,6 +289,12 @@ class KiwiSourceRegistry:
             """
             CREATE INDEX IF NOT EXISTS idx_runs_started_ts
             ON scan_runs(started_ts)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_probe_budget_updated_ts
+            ON probe_budget_day(updated_ts)
             """
         )
         cur.execute(
@@ -303,6 +325,15 @@ class KiwiSourceRegistry:
         additions = [
             ("monitor_reconnects", "monitor_reconnects INTEGER NOT NULL DEFAULT 0"),
             ("monitor_switches", "monitor_switches INTEGER NOT NULL DEFAULT 0"),
+            ("cooldown_until_ts", "cooldown_until_ts INTEGER"),
+            ("next_probe_ts", "next_probe_ts INTEGER"),
+            ("backoff_level", "backoff_level INTEGER NOT NULL DEFAULT 0"),
+            ("last_users", "last_users INTEGER"),
+            ("last_users_max", "last_users_max INTEGER"),
+            ("last_status_ts", "last_status_ts INTEGER"),
+            ("last_audio_ok_ts", "last_audio_ok_ts INTEGER"),
+            ("last_audio_fail_ts", "last_audio_fail_ts INTEGER"),
+            ("audio_dropouts", "audio_dropouts INTEGER NOT NULL DEFAULT 0"),
         ]
         for name, ddl in additions:
             if name in existing:
@@ -611,6 +642,161 @@ class KiwiSourceRegistry:
             return None
         return int(row["last_seen_ts"])
 
+    def get_schedule(
+        self,
+        server: str,
+    ) -> tuple[int | None, int | None, int]:
+        text = str(server).strip()
+        if not text:
+            return None, None, 0
+        cur = self._conn.cursor()
+        row = cur.execute(
+            """
+            SELECT cooldown_until_ts, next_probe_ts, backoff_level
+            FROM sources
+            WHERE server=?
+            """,
+            (text,),
+        ).fetchone()
+        if row is None:
+            return None, None, 0
+        cooldown = int(row["cooldown_until_ts"]) if row["cooldown_until_ts"] else None
+        next_probe = int(row["next_probe_ts"]) if row["next_probe_ts"] else None
+        backoff = int(row["backoff_level"] or 0)
+        return cooldown, next_probe, backoff
+
+    def is_due(self, server: str, *, now_ts: int | None = None) -> bool:
+        now = _now_ts() if now_ts is None else int(now_ts)
+        cooldown, next_probe, _backoff = self.get_schedule(server)
+        if cooldown is not None and cooldown > now:
+            return False
+        if next_probe is not None and next_probe > now:
+            return False
+        return True
+
+    @staticmethod
+    def _day_key(ts: int) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(int(ts)))
+
+    def get_daily_probe_budget(
+        self,
+        *,
+        now_ts: int | None = None,
+        cap: int | None = None,
+    ) -> tuple[str, int, int]:
+        now = _now_ts() if now_ts is None else int(now_ts)
+        day = self._day_key(now)
+        cap_value = (
+            int(self._policy.daily_probe_cap) if cap is None else max(0, int(cap))
+        )
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT used, cap FROM probe_budget_day WHERE day=?",
+            (day,),
+        ).fetchone()
+        if row is None:
+            return day, 0, cap_value
+        used = int(row["used"])
+        current_cap = int(row["cap"])
+        return day, used, cap_value if cap is not None else current_cap
+
+    def reserve_daily_probe_budget(
+        self,
+        requested: int,
+        *,
+        now_ts: int | None = None,
+        cap: int | None = None,
+    ) -> tuple[int, str, int, int]:
+        now = _now_ts() if now_ts is None else int(now_ts)
+        day = self._day_key(now)
+        req = max(0, int(requested))
+        cap_value = (
+            int(self._policy.daily_probe_cap) if cap is None else max(0, int(cap))
+        )
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO probe_budget_day(day, used, cap, updated_ts)
+            VALUES(?, 0, ?, ?)
+            ON CONFLICT(day) DO UPDATE SET
+              cap=excluded.cap,
+              updated_ts=excluded.updated_ts
+            """,
+            (day, cap_value, now),
+        )
+        row = cur.execute(
+            "SELECT used, cap FROM probe_budget_day WHERE day=?",
+            (day,),
+        ).fetchone()
+        used = int(row["used"]) if row is not None else 0
+        cap_db = int(row["cap"]) if row is not None else cap_value
+        remaining = max(0, cap_db - used)
+        allowed = min(req, remaining)
+        if allowed > 0:
+            cur.execute(
+                """
+                UPDATE probe_budget_day
+                SET used=?, updated_ts=?
+                WHERE day=?
+                """,
+                (used + allowed, now, day),
+            )
+            self._conn.commit()
+            return allowed, day, used + allowed, cap_db
+        self._conn.commit()
+        return 0, day, used, cap_db
+
+    def _stable_jitter_seconds(
+        self,
+        *,
+        server: str,
+        seed_ts: int,
+        jitter_max_seconds: int,
+    ) -> int:
+        lim = max(0, int(jitter_max_seconds))
+        if lim <= 0:
+            return 0
+        raw = hashlib.sha256(f"{server}:{seed_ts}".encode()).digest()
+        val = int.from_bytes(raw[:4], "big", signed=False)
+        span = lim * 2 + 1
+        return int(val % span) - lim
+
+    def _schedule_after_probe(
+        self,
+        *,
+        server: str,
+        now_ts: int,
+        success: bool,
+        prior_backoff_level: int,
+    ) -> tuple[int | None, int | None, int]:
+        min_interval_days = max(0, int(self._policy.scan_min_interval_days))
+        base_success = (
+            max(3600, min_interval_days * 86400) if min_interval_days > 0 else 3600
+        )
+        max_days = max(1, int(self._policy.invalid_ttl_days))
+        if success:
+            next_backoff = max(0, int(prior_backoff_level) - 1)
+            jitter = self._stable_jitter_seconds(
+                server=server,
+                seed_ts=now_ts,
+                jitter_max_seconds=min(3600, base_success // 10),
+            )
+            next_probe = now_ts + base_success + jitter
+            return None, int(next_probe), next_backoff
+
+        next_backoff = min(10, max(0, int(prior_backoff_level)) + 1)
+        base_fail = (
+            max(3600, min_interval_days * 86400) if min_interval_days > 0 else 3600
+        )
+        delay = min(max_days * 86400, base_fail * (2**next_backoff))
+        jitter = self._stable_jitter_seconds(
+            server=server,
+            seed_ts=now_ts,
+            jitter_max_seconds=min(3600, delay // 10),
+        )
+        until = now_ts + delay + jitter
+        return int(until), int(until), next_backoff
+
     def _get_source_counters(
         self,
         cur: sqlite3.Cursor,
@@ -787,6 +973,16 @@ class KiwiSourceRegistry:
             monitor_reconnects=monitor_reconnects,
             monitor_switches=monitor_switches,
         )
+        _cooldown, _next_probe, prior_backoff = self.get_schedule(result.server)
+        cooldown_until_ts, next_probe_ts, backoff_level = self._schedule_after_probe(
+            server=result.server,
+            now_ts=ts,
+            success=bool(result.tcp_ok),
+            prior_backoff_level=int(prior_backoff),
+        )
+        status_ts = ts if bool(result.status_ok) else None
+        last_users = result.users
+        last_users_max = result.users_max
 
         cur.execute(
             """
@@ -802,6 +998,12 @@ class KiwiSourceRegistry:
               last_kiwi_ts=?,
               last_error=?,
               score=?,
+              cooldown_until_ts=?,
+              next_probe_ts=?,
+              backoff_level=?,
+              last_users=COALESCE(?, last_users),
+              last_users_max=COALESCE(?, last_users_max),
+              last_status_ts=COALESCE(?, last_status_ts),
               enabled=CASE WHEN ? THEN 1 ELSE enabled END
             WHERE server=?
             """,
@@ -817,6 +1019,12 @@ class KiwiSourceRegistry:
                 result.kiwi_ts,
                 result.error,
                 score,
+                cooldown_until_ts,
+                next_probe_ts,
+                int(backoff_level),
+                last_users,
+                last_users_max,
+                status_ts,
                 1 if enable_after_ok else 0,
                 result.server,
             ),
@@ -901,7 +1109,8 @@ class KiwiSourceRegistry:
                   failures,
                   consecutive_failures,
                   monitor_reconnects,
-                  monitor_switches
+                  monitor_switches,
+                  backoff_level
                 FROM sources
                 WHERE server=?
                 """,
@@ -915,6 +1124,7 @@ class KiwiSourceRegistry:
             consecutive = int(row["consecutive_failures"])
             monitor_reconnects = int(row["monitor_reconnects"])
             monitor_switches = int(row["monitor_switches"])
+            prior_backoff = int(row["backoff_level"] or 0)
 
             if r.tcp_ok:
                 successes += 1
@@ -938,6 +1148,19 @@ class KiwiSourceRegistry:
                 monitor_reconnects=monitor_reconnects,
                 monitor_switches=monitor_switches,
             )
+            (
+                cooldown_until_ts,
+                next_probe_ts,
+                backoff_level,
+            ) = self._schedule_after_probe(
+                server=server,
+                now_ts=ts,
+                success=bool(r.tcp_ok),
+                prior_backoff_level=prior_backoff,
+            )
+            status_ts = ts if bool(r.status_ok) else None
+            last_users = r.users
+            last_users_max = r.users_max
 
             cur.execute(
                 """
@@ -953,6 +1176,12 @@ class KiwiSourceRegistry:
                   last_kiwi_ts=?,
                   last_error=?,
                   score=?,
+                  cooldown_until_ts=?,
+                  next_probe_ts=?,
+                  backoff_level=?,
+                  last_users=COALESCE(?, last_users),
+                  last_users_max=COALESCE(?, last_users_max),
+                  last_status_ts=COALESCE(?, last_status_ts),
                   enabled=CASE WHEN ? THEN 1 ELSE enabled END
                 WHERE server=?
                 """,
@@ -968,6 +1197,12 @@ class KiwiSourceRegistry:
                     r.kiwi_ts,
                     r.error,
                     score,
+                    cooldown_until_ts,
+                    next_probe_ts,
+                    int(backoff_level),
+                    last_users,
+                    last_users_max,
+                    status_ts,
                     1 if enable_after_ok else 0,
                     server,
                 ),
@@ -1047,6 +1282,48 @@ class KiwiSourceRegistry:
             """,
             (monitor_reconnects, monitor_switches, score, text),
         )
+        self._conn.commit()
+        total_limit = (
+            int(self._policy.max_total) if max_total == 1000 else int(max_total)
+        )
+        self.prune(max_total=total_limit)
+
+    def record_audio_health(
+        self,
+        *,
+        server: str,
+        ok: bool,
+        max_total: int = 1000,
+    ) -> None:
+        text = str(server).strip()
+        if not text:
+            return
+        try:
+            parse_kiwi_server_address(text)
+        except Exception:
+            return
+        ts = _now_ts()
+        cur = self._conn.cursor()
+        self._upsert_source_cur(cur, text, ts)
+        if bool(ok):
+            cur.execute(
+                """
+                UPDATE sources SET
+                  last_audio_ok_ts=COALESCE(?, last_audio_ok_ts)
+                WHERE server=?
+                """,
+                (ts, text),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE sources SET
+                  last_audio_fail_ts=COALESCE(?, last_audio_fail_ts),
+                  audio_dropouts=audio_dropouts + 1
+                WHERE server=?
+                """,
+                (ts, text),
+            )
         self._conn.commit()
         total_limit = (
             int(self._policy.max_total) if max_total == 1000 else int(max_total)
@@ -1135,7 +1412,12 @@ class KiwiSourceRegistry:
                   failures,
                   consecutive_failures,
                   last_latency_ms,
-                  last_seen_ts
+                  last_seen_ts,
+                  last_users,
+                  last_users_max,
+                  last_status_ts,
+                  last_audio_ok_ts,
+                  audio_dropouts
                 FROM sources
                 WHERE enabled=1
                 ORDER BY score DESC, successes DESC, failures ASC, server ASC
@@ -1154,7 +1436,12 @@ class KiwiSourceRegistry:
                   failures,
                   consecutive_failures,
                   last_latency_ms,
-                  last_seen_ts
+                  last_seen_ts,
+                  last_users,
+                  last_users_max,
+                  last_status_ts,
+                  last_audio_ok_ts,
+                  audio_dropouts
                 FROM sources
                 ORDER BY
                   enabled DESC,
@@ -1186,6 +1473,25 @@ class KiwiSourceRegistry:
                         if r["last_seen_ts"] is not None
                         else None
                     ),
+                    last_users=(
+                        int(r["last_users"]) if r["last_users"] is not None else None
+                    ),
+                    last_users_max=(
+                        int(r["last_users_max"])
+                        if r["last_users_max"] is not None
+                        else None
+                    ),
+                    last_status_ts=(
+                        int(r["last_status_ts"])
+                        if r["last_status_ts"] is not None
+                        else None
+                    ),
+                    last_audio_ok_ts=(
+                        int(r["last_audio_ok_ts"])
+                        if r["last_audio_ok_ts"] is not None
+                        else None
+                    ),
+                    audio_dropouts=int(r["audio_dropouts"] or 0),
                 )
             )
         return out

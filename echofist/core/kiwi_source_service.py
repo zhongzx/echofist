@@ -15,6 +15,8 @@ from echofist.core.kiwi_sources import (
     KiwiSourceSummary,
 )
 
+_MAX_TRUSTED_USERS_MAX = 8
+
 
 @dataclass(frozen=True, slots=True)
 class KiwiSourceQuality:
@@ -24,6 +26,11 @@ class KiwiSourceQuality:
     scan_days: int
     last_seen_ts: int | None
     last_latency_ms: float | None
+    last_users: int | None
+    last_users_max: int | None
+    last_status_ts: int | None
+    last_audio_ok_ts: int | None
+    audio_dropouts: int
     enabled: bool
 
 
@@ -35,7 +42,28 @@ class KiwiSourceInsight:
     effective_score: float
     scan_days: int
     last_seen_ts: int | None
+    last_users: int | None
+    last_users_max: int | None
+    last_status_ts: int | None
+    last_audio_ok_ts: int | None
+    audio_dropouts: int
     blocked: list[KiwiBlockedSourceRow]
+
+
+@dataclass(frozen=True, slots=True)
+class KiwiProbeRunResult:
+    run_id: str
+    planned: list[str]
+    scanned: list[KiwiReachabilityResult]
+    ok: int
+    fail: int
+    avg_latency_ms: float | None
+    daily_budget_day: str
+    daily_budget_cap: int
+    daily_budget_used_before: int
+    daily_budget_used_after: int
+    prune_disabled: int
+    expired_blocks: int
 
 
 def _compute_effective_score(*, score: float, scan_days: int) -> float:
@@ -114,6 +142,8 @@ class KiwiSourceService:
         for s in deduped:
             if self._registry.is_blocked(s):
                 continue
+            if not self._registry.is_due(s):
+                continue
             if cutoff_ts is not None:
                 last_seen = self._registry.get_last_seen_ts(s)
                 if last_seen is not None and int(last_seen) > cutoff_ts:
@@ -130,25 +160,106 @@ class KiwiSourceService:
         concurrency: int = 5,
         timeout_seconds: float = 1.2,
         verify_http: bool = True,
+        fetch_status: bool = False,
         min_interval_days: int | None = None,
         limit: int = 200,
         max_total: int = 1000,
     ) -> list[KiwiReachabilityResult]:
+        run = await self.probe_and_learn_run(
+            servers,
+            concurrency=concurrency,
+            timeout_seconds=timeout_seconds,
+            verify_http=verify_http,
+            fetch_status=fetch_status,
+            min_interval_days=min_interval_days,
+            limit=limit,
+            max_total=max_total,
+        )
+        return list(run.scanned)
+
+    async def probe_and_learn_run(
+        self,
+        servers: Sequence[str],
+        *,
+        concurrency: int = 5,
+        timeout_seconds: float = 1.2,
+        verify_http: bool = True,
+        fetch_status: bool = False,
+        min_interval_days: int | None = None,
+        limit: int = 200,
+        max_total: int = 1000,
+    ) -> KiwiProbeRunResult | None:
         planned = self.plan_probes(
             servers,
             min_interval_days=min_interval_days,
             limit=limit,
         )
         if not planned:
-            return []
+            return None
+
+        cfg = load_config().kiwi_sources
+        day, used_before, cap = self._registry.get_daily_probe_budget()
+        allowed, _day, used_after, cap_db = self._registry.reserve_daily_probe_budget(
+            len(planned),
+            cap=int(cfg.daily_probe_cap),
+        )
+        planned = planned[: int(allowed)]
+        if not planned:
+            return None
+
+        run_id = self._registry.start_scan_run(
+            mode="service",
+            concurrency=int(concurrency),
+            timeout_seconds=float(timeout_seconds),
+            verify_http=bool(verify_http),
+            candidate_source="service",
+            limit_n=len(planned),
+            note=(
+                f"daily_budget_day={day} "
+                f"cap={cap_db} used_before={used_before} used_after={used_after}"
+            ),
+        )
         results = await scan_kiwi_reachability(
             planned,
             concurrency=concurrency,
             timeout_seconds=timeout_seconds,
             verify_http=verify_http,
+            fetch_status=fetch_status,
         )
-        self._registry.record_scans(results, max_total=max_total)
-        return results
+        _added, disabled = self._registry.record_scans(
+            results,
+            max_total=max_total,
+            run_id=run_id,
+        )
+        expired = self._registry.expire_blocks()
+        ok_results = [r for r in results if r.tcp_ok]
+        avg_latency = (
+            (sum(float(r.latency_ms or 0.0) for r in ok_results) / len(ok_results))
+            if ok_results
+            else None
+        )
+        self._registry.finish_scan_run(
+            run_id,
+            ok=len(ok_results),
+            fail=len(results) - len(ok_results),
+            avg_latency_ms=avg_latency,
+            prune_disabled=disabled,
+            expired_blocks=expired,
+        )
+        return KiwiProbeRunResult(
+            run_id=str(run_id),
+            planned=list(planned),
+            scanned=list(results),
+            ok=int(len(ok_results)),
+            fail=int(len(results) - len(ok_results)),
+            avg_latency_ms=float(avg_latency) if avg_latency is not None else None,
+            daily_budget_day=str(day),
+            daily_budget_cap=int(cap_db),
+            daily_budget_used_before=int(used_before),
+            daily_budget_used_after=int(used_after),
+            prune_disabled=int(disabled),
+            expired_blocks=int(expired),
+        )
 
     def pick_best(
         self,
@@ -159,6 +270,7 @@ class KiwiSourceService:
         include_disabled: bool = False,
     ) -> list[KiwiSourceQuality]:
         n = max(1, int(target))
+        now_ts = int(time.time())
         summaries = self._registry.list_sources(
             limit=max(50, n * 4),
             enabled_only=not include_disabled,
@@ -168,6 +280,15 @@ class KiwiSourceService:
         out: list[KiwiSourceQuality] = []
         for s in summaries:
             if self._registry.is_blocked(s.server):
+                continue
+            if (
+                s.last_status_ts is not None
+                and now_ts - int(s.last_status_ts) <= 300
+                and s.last_users is not None
+                and s.last_users_max is not None
+                and int(s.last_users_max) <= _MAX_TRUSTED_USERS_MAX
+                and int(s.last_users) >= int(s.last_users_max)
+            ):
                 continue
             scan_days = self._registry.count_scan_days(
                 s.server,
@@ -184,6 +305,11 @@ class KiwiSourceService:
                     scan_days=int(scan_days),
                     last_seen_ts=s.last_seen_ts,
                     last_latency_ms=s.last_latency_ms,
+                    last_users=s.last_users,
+                    last_users_max=s.last_users_max,
+                    last_status_ts=s.last_status_ts,
+                    last_audio_ok_ts=s.last_audio_ok_ts,
+                    audio_dropouts=int(s.audio_dropouts),
                     enabled=bool(s.enabled),
                 )
             )
@@ -225,5 +351,10 @@ class KiwiSourceService:
             effective_score=float(eff),
             scan_days=int(scan_days),
             last_seen_ts=summary.last_seen_ts,
+            last_users=summary.last_users,
+            last_users_max=summary.last_users_max,
+            last_status_ts=summary.last_status_ts,
+            last_audio_ok_ts=summary.last_audio_ok_ts,
+            audio_dropouts=int(summary.audio_dropouts),
             blocked=blocked,
         )
