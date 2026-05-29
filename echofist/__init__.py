@@ -8,11 +8,7 @@ __version__ = "0.1.0"
 __author__ = "EchoFist Team"
 __license__ = "MIT"
 
-from echofist.config import AppConfig
-from echofist.logger import setup_logger
-
 # 导出主要模块
 __all__ = [
-    "AppConfig",
-    "setup_logger",
+    "__version__",
 ]

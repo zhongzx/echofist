@@ -14,33 +14,58 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-import click
-import numpy as np
-from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+try:
+    import click
+    import numpy as np
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+except ModuleNotFoundError as e:
+    print(
+        "缺少运行依赖，EchoFist 无法启动。\n"
+        f"错误：{e}\n\n"
+        "建议使用虚拟环境并安装依赖：\n"
+        "  python3 -m venv .venv\n"
+        "  source .venv/bin/activate\n"
+        "  pip install -r requirements.txt\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from e
 
-from echofist import __version__
-from echofist.config import load_config
-from echofist.core.kiwi_client import (
-    KiwiReachabilityResult,
-    KiwiSDRClient,
-    scan_kiwi_reachability,
-)
-from echofist.core.kiwi_sources import (
-    KiwiScanHistoryRow,
-    KiwiSourceRegistry,
-    KiwiSourceSummary,
-    fetch_public_kiwi_sources,
-    parse_kiwi_public_text,
-)
-from echofist.core.morse_decoder import MorseDecoder
-from echofist.core.qso_state import QSOStateMachine
-from echofist.logger import setup_logger
-from echofist.ui.dashboard import Dashboard
+try:
+    from echofist import __version__
+    from echofist.config import load_config
+    from echofist.core.kiwi_client import (
+        KiwiReachabilityResult,
+        KiwiSDRClient,
+        scan_kiwi_reachability,
+    )
+    from echofist.core.kiwi_sources import (
+        KiwiScanHistoryRow,
+        KiwiSourceRegistry,
+        KiwiSourceSummary,
+        extract_servers_from_lines,
+        extract_servers_from_text,
+        fetch_public_kiwi_sources,
+        parse_kiwi_public_text,
+    )
+    from echofist.core.morse_decoder import MorseDecoder
+    from echofist.core.qso_state import QSOStateMachine
+    from echofist.logger import setup_logger
+    from echofist.ui.dashboard import Dashboard
+except ModuleNotFoundError as e:
+    print(
+        "EchoFist 启动失败：缺少依赖或环境未正确安装。\n"
+        f"错误：{e}\n\n"
+        "建议：\n"
+        "1) 使用 Python 3.10+ 的虚拟环境\n"
+        "2) 安装依赖：pip install -r requirements.txt\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from e
 
 console = Console()
 logger = setup_logger()
@@ -628,6 +653,117 @@ def print_kiwi_history(rows: list[KiwiScanHistoryRow]) -> None:
         )
 
     console.print(table)
+
+
+def _server_list_format_help() -> str:
+    return (
+        "请粘贴服务器列表，格式要求：每行一个 host:port（端口 8000-9000）\n"
+        "示例：\n"
+        "  db0ovp.de:8073\n"
+        "  85.147.201.225:8073\n"
+        "\n"
+        "粘贴完成后：直接连按两次回车结束（推荐），或输入 END 结束，或 Ctrl-D 结束。"
+    )
+
+
+def _ai_prompt_templates() -> list[str]:
+    return [
+        (
+            "你是一个数据清洗助手。请从我提供的网页复制文本中提取所有 KiwiSDR 服务器地址。\n"
+            "输出要求：\n"
+            "1) 只输出纯文本，不要解释\n"
+            "2) 每行一个 host:port\n"
+            "3) 端口必须在 8000-9000\n"
+            "4) 去重\n"
+            "5) 不要输出任何其它内容（不要标题/序号/代码块标记）\n"
+            "\n"
+            "原始文本如下：\n"
+            "<<<TEXT_START>>>\n"
+            "{PASTE_HERE}\n"
+            "<<<TEXT_END>>>"
+        ),
+        (
+            "请把下面的原始文本整理成 KiwiSDR 服务器列表。\n"
+            "输出要求：每行一个 host:port；如果只出现了 host 没有端口，则默认 :8073。\n"
+            "仅输出列表本身，不要解释、不要编号、不要代码块。\n"
+            "\n"
+            "原始文本：\n"
+            "<<<TEXT_START>>>\n"
+            "{PASTE_HERE}\n"
+            "<<<TEXT_END>>>"
+        ),
+        (
+            "请执行严格抽取并校验：\n"
+            "- 只保留形如 domain:port 或 ipv4:port 的条目\n"
+            "- 端口范围必须是 8000-9000\n"
+            "- 去重\n"
+            "- 输出每行一个 host:port，不要任何额外文本\n"
+            "\n"
+            "原始文本：\n"
+            "<<<TEXT_START>>>\n"
+            "{PASTE_HERE}\n"
+            "<<<TEXT_END>>>"
+        ),
+    ]
+
+
+def _read_pasted_block() -> str:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return sys.stdin.read()
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == "END":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _read_servers_block(
+    *,
+    max_lines: int = 50_000,
+    max_servers: int = 5_000,
+) -> tuple[list[str], int, int, bool]:
+    def iter_lines() -> Sequence[str]:
+        lines: list[str] = []
+        n = 0
+        blanks = 0
+        started = False
+        while True:
+            if n >= int(max_lines):
+                break
+            try:
+                line = input()
+            except EOFError:
+                break
+            stripped = line.strip()
+            if stripped:
+                started = True
+                blanks = 0
+            else:
+                blanks += 1
+                if started and blanks >= 2:
+                    break
+            if stripped.upper() == "END":
+                break
+            lines.append(line)
+            n += 1
+        return lines
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        content = sys.stdin.read()
+        servers, invalid = extract_servers_from_text(content)
+        lines_read = content.count("\n") + (1 if content.strip() else 0)
+        return servers, int(invalid), int(lines_read), False
+
+    lines = iter_lines()
+    return extract_servers_from_lines(
+        lines,
+        max_servers=max_servers,
+    )
 
 
 async def monitor_mode(
@@ -1498,13 +1634,173 @@ def sources_fetch(
                 "未提取到任何服务器条目。\n"
                 "可能原因：公共目录返回验证码/反爬页面，或网络环境无法直连。\n\n"
                 "可选方案：\n"
-                "1) 浏览器打开 http://kiwisdr.com/public/ 或 https://rx.kiwisdr.com/ ，"
+                "1) 使用 sources add 按提示粘贴 host:port 列表（推荐）\n"
+                "2) 浏览器打开 http://kiwisdr.com/public/ 或 https://rx.kiwisdr.com/ ，"
                 "保存页面HTML后用 --html-file 导入\n"
-                "2) 将HTML内容粘贴到命令行并用 --html-stdin 导入（Ctrl-D 结束）",
+                "3) 将HTML内容粘贴到命令行并用 --html-stdin 导入（Ctrl-D 结束）",
                 title="提示",
                 border_style="yellow",
             )
         )
+
+
+@sources.command("add")
+def sources_add() -> None:
+    """交互式添加源：粘贴 host:port 列表并写入注册表"""
+    print_banner()
+    registry = KiwiSourceRegistry()
+    config = load_config()
+    max_total = int(config.kiwi_sources.max_total)
+
+    try:
+        public_urls = [
+            "https://rx.kiwisdr.com/",
+            "https://rx.kiwisdr.com/public/",
+            "https://kiwisdr.com/public/",
+        ]
+
+        def render_step1() -> Panel:
+            body = Text.from_markup(
+                "第 1 步：去网页复制“原始内容”\n\n"
+                "请先打开下面任意一个网址（任选其一即可）：\n"
+                f"- [link={public_urls[0]}]{public_urls[0]}[/link]\n"
+                f"- [link={public_urls[1]}]{public_urls[1]}[/link]\n"
+                f"- [link={public_urls[2]}]{public_urls[2]}[/link]\n\n"
+                "在页面里随便滚动一下，然后把页面上能看到的服务器列表相关内容尽量多地复制出来。\n"
+                "（可以是一大段文字/链接/杂乱内容都没关系，这一步不需要整理）"
+            )
+            return Panel(body, title="添加源（第 1/3 步）", border_style="cyan")
+
+        while True:
+            console.print(render_step1())
+            action = _select_menu(
+                title="第 1 步",
+                options=["已复制原始内容", "打开网页（自动）", "取消（VY 73）"],
+                render_option=lambda s: str(s),
+                default_index=0,
+            )
+            if action == "取消（VY 73）" or action is None:
+                console.print("[dim]VY 73[/dim]")
+                return
+            if action == "打开网页（自动）":
+                try:
+                    import webbrowser
+
+                    webbrowser.open(public_urls[0])
+                except Exception:
+                    pass
+                continue
+            if action == "已复制原始内容":
+                break
+
+        templates = _ai_prompt_templates()
+        template_index = 0
+        while template_index < len(templates):
+            console.print(
+                Panel(
+                    templates[template_index],
+                    title=f"提示词模板 {template_index + 1}/3（第 2/3 步）",
+                    border_style="yellow",
+                )
+            )
+            action = _select_menu(
+                title="第 2 步",
+                options=[
+                    "我已在 AI 得到 host:port 列表",
+                    "换下一模板",
+                    "取消（VY 73）",
+                ],
+                render_option=lambda s: str(s),
+                default_index=0,
+            )
+            if action == "取消（VY 73）" or action is None:
+                console.print("[dim]VY 73[/dim]")
+                return
+            if action == "换下一模板":
+                template_index += 1
+                continue
+            if action == "我已在 AI 得到 host:port 列表":
+                while True:
+                    console.print(
+                        Panel(
+                            _server_list_format_help(),
+                            title="添加源（第 3/3 步）",
+                            border_style="cyan",
+                        )
+                    )
+                    servers, invalid, lines_read, truncated = _read_servers_block()
+                    if not servers:
+                        hint = (
+                            "没有收到任何输入。\n"
+                            "请把 AI 输出的 host:port 列表粘贴进来，然后连按两次回车结束。"
+                            if lines_read <= 0
+                            else (
+                                f"已读取 {lines_read} 行，但未匹配到服务器条目。\n"
+                                "请确认 AI 输出是“每行一个 host:port”，或返回上一页更换提示词模板。"
+                            )
+                        )
+                        console.print(
+                            Panel(
+                                hint,
+                                title="未解析到服务器条目",
+                                border_style="yellow",
+                            )
+                        )
+                        action2 = _select_menu(
+                            title="未解析到服务器条目",
+                            options=["重新粘贴", "返回模板", "取消（VY 73）"],
+                            render_option=lambda s: str(s),
+                            default_index=0,
+                        )
+                        if action2 == "取消（VY 73）" or action2 is None:
+                            console.print("[dim]VY 73[/dim]")
+                            return
+                        if action2 == "返回模板":
+                            template_index += 1
+                            break
+                        continue
+
+                    preview = "\n".join(servers[:12])
+                    console.print(
+                        Panel(
+                            f"解析到：{len(servers)} 条（疑似无效片段：{invalid}）"
+                            f"{'（已截断）' if truncated else ''}\n\n{preview}",
+                            title="预览",
+                            border_style="green",
+                        )
+                    )
+                    action3 = _select_menu(
+                        title="下一步",
+                        options=["导入", "重试粘贴", "取消（VY 73）"],
+                        render_option=lambda s: str(s),
+                        default_index=0,
+                    )
+                    if action3 == "重试粘贴":
+                        continue
+                    if action3 == "取消（VY 73）" or action3 is None:
+                        console.print("[dim]VY 73[/dim]")
+                        return
+
+                    added = registry.add_sources(
+                        servers,
+                        daily_cap=len(servers),
+                        max_total=max_total,
+                    )
+                    stats = registry.stats()
+                    console.print(
+                        Panel(
+                            f"新增：{added}\n启用：{stats['enabled']}\n总量：{stats['total']}",
+                            title="导入完成",
+                            border_style="green",
+                        )
+                    )
+                    return
+
+                continue
+
+        console.print("[dim]三套模板仍未得到可用列表，VY 73[/dim]")
+    finally:
+        registry.close()
 
 
 @sources.command("list")

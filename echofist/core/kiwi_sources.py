@@ -22,6 +22,83 @@ from echofist.config import ConfigManager, load_config
 from echofist.core.kiwi_client import KiwiReachabilityResult, parse_kiwi_server_address
 
 
+def extract_servers_from_text(
+    text: str,
+    *,
+    default_port: int = 8073,
+) -> tuple[list[str], int]:
+    raw = str(text)
+    pattern = re.compile(
+        r"(?:(\d{1,3}(?:\.\d{1,3}){3})|([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+))"
+        r"(?:\s*:\s*(\d{2,5}))?",
+        flags=re.IGNORECASE,
+    )
+    tokens = pattern.findall(raw)
+    servers: list[str] = []
+    invalid = 0
+
+    for ip, domain, port_str in tokens:
+        host = ip or domain
+        if not host:
+            continue
+        port = int(port_str) if port_str else int(default_port)
+        if not (8000 <= port <= 9000):
+            invalid += 1
+            continue
+        server = f"{host}:{port}"
+        try:
+            parse_kiwi_server_address(server)
+        except Exception:
+            invalid += 1
+            continue
+        if server not in servers:
+            servers.append(server)
+
+    return servers, int(invalid)
+
+
+def extract_servers_from_lines(
+    lines: Iterable[str],
+    *,
+    default_port: int = 8073,
+    max_servers: int = 5000,
+) -> tuple[list[str], int, int, bool]:
+    servers: list[str] = []
+    invalid = 0
+    lines_read = 0
+    truncated = False
+
+    pattern = re.compile(
+        r"(?:(\d{1,3}(?:\.\d{1,3}){3})|([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+))"
+        r"(?:\s*:\s*(\d{2,5}))?",
+        flags=re.IGNORECASE,
+    )
+
+    for line in lines:
+        lines_read += 1
+        for ip, domain, port_str in pattern.findall(str(line)):
+            host = ip or domain
+            if not host:
+                continue
+            port = int(port_str) if port_str else int(default_port)
+            if not (8000 <= port <= 9000):
+                invalid += 1
+                continue
+            server = f"{host}:{port}"
+            try:
+                parse_kiwi_server_address(server)
+            except Exception:
+                invalid += 1
+                continue
+            if server not in servers:
+                servers.append(server)
+                if len(servers) >= int(max_servers):
+                    truncated = True
+                    return servers, int(invalid), int(lines_read), truncated
+
+    return servers, int(invalid), int(lines_read), truncated
+
+
 @dataclass(frozen=True, slots=True)
 class KiwiSourceSummary:
     server: str
