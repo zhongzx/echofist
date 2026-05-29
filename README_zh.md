@@ -46,18 +46,63 @@ python -m echofist --help
 ## 📁 项目结构
 
 ```
-echofist/
-├── echofist/              # 主包目录
-│   ├── core/             # 核心模块
-│   ├── ai/               # AI/ML模块
-│   ├── ui/               # 文本界面
-│   ├── data/             # 数据管理
-│   └── utils/            # 工具函数
-├── tests/                # 测试目录
-├── scripts/              # 工具脚本
-├── data/                 # 数据文件
-├── docs/                 # 文档
-└── examples/             # 示例代码
+EchoFist/
+├── echofist/                    # 主包目录
+│   ├── __main__.py              # CLI 入口
+│   ├── config.py                # 配置管理
+│   ├── logger.py                # 日志配置
+│   ├── core/                    # 核心模块
+│   │   ├── audio_processor.py   # 音频处理
+│   │   ├── morse_decoder.py     # 摩尔斯解码
+│   │   ├── kiwi_client.py       # KiwiSDR 客户端
+│   │   ├── fist_extractor.py    # 手法特征提取
+│   │   └── qso_state.py         # QSO 状态管理
+│   ├── ui/                      # TUI 界面
+│   │   └── dashboard.py         # 仪表板界面
+│   └── utils/                   # 工具函数
+├── docs/                        # 文档
+├── assets/                      # 素材
+└── tests/                       # 测试
+```
+
+## 🧩 系统模块设计图（总览）
+
+```mermaid
+flowchart TB
+  subgraph L1[UI/UX 层]
+    cli[echofist.__main__ / CLI]
+    dashboard[ui.dashboard]
+  end
+
+  subgraph L2[核心功能层]
+    audio[core.audio_processor]
+    morse[core.morse_decoder]
+    kiwi[core.kiwi_client]
+    fist[core.fist_extractor]
+    qso[core.qso_state]
+  end
+
+  subgraph L0[基座层]
+    config[config]
+    logger[logger]
+    utils[utils]
+  end
+
+  cli --> dashboard
+  dashboard --> qso
+
+  qso --> audio
+  qso --> morse
+  qso --> kiwi
+  qso --> fist
+
+  cli --> config
+  cli --> logger
+  dashboard --> logger
+
+  audio --> utils
+  morse --> utils
+  kiwi --> utils
 ```
 
 ## 🔧 技术栈
