@@ -1,0 +1,373 @@
+[meta]
+supported = ["zh", "en", "ja"]
+default_language = "zh"
+fallback_language = "en"
+
+[zh.common]
+language_select_title = "选择界面语言"
+language_zh = "中文"
+language_en = "English"
+language_ja = "日本語"
+menu_help = "↑↓ 选择 | Enter 确认 | Esc 取消"
+menu_help_monitor = "q 退出 | b 返回 | l 语言"
+press_ctrl_c_stop = "按 Ctrl+C 停止"
+
+[zh.home]
+title = "主菜单"
+help = "↑↓ 选择 | Enter 确认 | Esc 退出 | l 语言"
+monitor = "监听（实时解码）"
+qso = "QSO（半自动通联）"
+exit = "退出"
+select_server = "选择服务器"
+select_band = "选择频段"
+select_freq = "选择频点"
+callsign_prompt = "呼号（可选）"
+
+[zh.banner]
+subtitle = "AI辅助等幅电报（CW）通讯软件"
+version = "版本: {version}"
+
+[zh.wizard]
+select_primary_server = "选择主服务器"
+add_backup_server = "添加备用服务器？"
+select_backup_server = "选择备用服务器"
+select_band = "选择频段"
+select_freq = "选择守听频点"
+not_add = "不添加"
+add = "添加"
+
+[zh.monitor]
+no_servers = "未提供可用的 KiwiSDR 服务器"
+cli_missing_server = "缺少 --server/-s，或启用 --wizard 交互选择"
+cli_missing_freq = "缺少 --freq/-f，或启用 --wizard 交互选择"
+disconnecting = "退出中..."
+disconnected = "退出成功"
+connect_ok = "✓ 已连接到KiwiSDR服务器"
+connect_failed_title = "连接失败"
+connect_failed_body = "无法连接到所选源，请返回重新选择。"
+connect_failed_any = "无法连接到任意 KiwiSDR 服务器"
+stop_listening = "正在停止监听..."
+listen_error = "监听模式错误: {error}"
+error_prefix = "错误: {error}"
+connecting = "连接中"
+reconnecting = "重连中"
+switching = "切换中"
+precheck_best = "预检：已选最稳源 {server}"
+precheck_learn = "预检学习：新增 {added} 淘汰 {disabled}"
+switch_prepare = "服务器不稳定，准备切换 {old_server} → ..."
+switch_now = "服务器不稳定，切换 {old_server} → {new_server}"
+switch_failed = "切换失败（{error}），稍后重试"
+reconnect_audio_stalled = "音频断流 {seconds:.1f}s，正在重连..."
+reconnect_failed_switching = "重连失败（{error}），尝试切换..."
+reconnect_failed = "重连失败（{error}）"
+audio_paused_wait = "音频暂停 {seconds:.1f}s，等待恢复..."
+
+[zh.qso]
+start = "启动QSO模式"
+server = "服务器: [cyan]{server}[/cyan]"
+freq = "频率: [yellow]{freq} MHz[/yellow]"
+callsign = "呼号: [blue]{callsign}[/blue]"
+waiting_cw = "等待CW信号..."
+suggestion = "[yellow]建议应答:[/yellow] [green]{suggestion}[/green]"
+stopping = "正在停止QSO..."
+error = "QSO模式错误: {error}"
+
+[zh.dashboard]
+app_name = "EchoFist"
+app_tagline = "回声手迹"
+header_title = "状态"
+connected = "已连接"
+disconnected = "未连接"
+waterfall_title = "瀑布图"
+waterfall_disabled = "瀑布图已禁用"
+freq_ruler = "← 频率 →"
+decoded_title = "解码文本"
+waiting_decode = "等待解码..."
+status_info_title = "状态信息"
+server = "服务器:"
+hint = "提示:"
+signal_strength = "信号强度:"
+confidence = "置信度:"
+audio_chunks = "音频块:"
+audio_queue = "音频队列:"
+playback = "播放:"
+playback_off = "关闭（加 --play-audio）"
+playback_buffer = "播放缓冲:"
+audio_rms = "音频RMS:"
+audio_age = "音频年龄:"
+reconnect_count = "重连次数:"
+switch_count = "切换次数:"
+hotkeys = "快捷键:"
+hotkeys_value = "q 退出 | b 返回设置 | l 语言"
+last_update = "最后更新:"
+seconds_ago = "{seconds:.1f}秒前"
+history = "历史记录:"
+history_count = "{count}条"
+
+[zh.band_presets.40m]
+qrp_calling = "{freq:.3f} QRP 呼叫"
+common = "{freq:.3f} 常用"
+
+[zh.band_presets.20m]
+qrp_calling = "{freq:.3f} QRP 呼叫"
+ncdxf_beacon = "{freq:.3f} NCDXF 信标"
+
+[zh.band_presets.17m]
+ncdxf_beacon = "{freq:.3f} NCDXF 信标"
+
+[zh.band_presets.15m]
+qrp_calling = "{freq:.3f} QRP 呼叫"
+ncdxf_beacon = "{freq:.3f} NCDXF 信标"
+
+[zh.band_presets.12m]
+ncdxf_beacon = "{freq:.3f} NCDXF 信标"
+
+[zh.band_presets.10m]
+qrp_calling = "{freq:.3f} QRP 呼叫"
+ncdxf_beacon = "{freq:.3f} NCDXF 信标"
+
+[en.common]
+language_select_title = "Select UI language"
+language_zh = "中文"
+language_en = "English"
+language_ja = "日本語"
+menu_help = "↑↓ Select | Enter Confirm | Esc Cancel"
+menu_help_monitor = "q Quit | b Back | l Language"
+press_ctrl_c_stop = "Press Ctrl+C to stop"
+
+[en.home]
+title = "Main Menu"
+help = "↑↓ Select | Enter Confirm | Esc Exit | l Language"
+monitor = "Monitor (decode)"
+qso = "QSO (assisted)"
+exit = "Exit"
+select_server = "Select server"
+select_band = "Select band"
+select_freq = "Select frequency"
+callsign_prompt = "Callsign (optional)"
+
+[en.banner]
+subtitle = "AI-assisted CW (Morse) communication software"
+version = "Version: {version}"
+
+[en.wizard]
+select_primary_server = "Select primary server"
+add_backup_server = "Add backup server?"
+select_backup_server = "Select backup server"
+select_band = "Select band"
+select_freq = "Select listening frequency"
+not_add = "No"
+add = "Yes"
+
+[en.monitor]
+no_servers = "No KiwiSDR servers provided"
+cli_missing_server = "Missing --server/-s, or enable --wizard for interactive selection"
+cli_missing_freq = "Missing --freq/-f, or enable --wizard for interactive selection"
+disconnecting = "Disconnecting..."
+disconnected = "Disconnected"
+connect_ok = "✓ Connected to KiwiSDR server"
+connect_failed_title = "Connection failed"
+connect_failed_body = "Cannot connect to the selected server. Go back and choose again."
+connect_failed_any = "Cannot connect to any KiwiSDR server"
+stop_listening = "Stopping..."
+listen_error = "Monitor error: {error}"
+error_prefix = "Error: {error}"
+connecting = "Connecting"
+reconnecting = "Reconnecting"
+switching = "Switching"
+precheck_best = "Precheck: selected best {server}"
+precheck_learn = "Precheck learn: added {added} disabled {disabled}"
+switch_prepare = "Server unstable, switching {old_server} → ..."
+switch_now = "Server unstable, switching {old_server} → {new_server}"
+switch_failed = "Switch failed ({error}), retry later"
+reconnect_audio_stalled = "Audio stalled {seconds:.1f}s, reconnecting..."
+reconnect_failed_switching = "Reconnect failed ({error}), trying next server..."
+reconnect_failed = "Reconnect failed ({error})"
+audio_paused_wait = "Audio paused {seconds:.1f}s, waiting..."
+
+[en.qso]
+start = "Starting QSO mode"
+server = "Server: [cyan]{server}[/cyan]"
+freq = "Frequency: [yellow]{freq} MHz[/yellow]"
+callsign = "Callsign: [blue]{callsign}[/blue]"
+waiting_cw = "Waiting for CW..."
+suggestion = "[yellow]Suggested reply:[/yellow] [green]{suggestion}[/green]"
+stopping = "Stopping QSO..."
+error = "QSO error: {error}"
+
+[en.dashboard]
+app_name = "EchoFist"
+app_tagline = "EchoFist"
+header_title = "Status"
+connected = "Connected"
+disconnected = "Disconnected"
+waterfall_title = "Waterfall"
+waterfall_disabled = "Waterfall disabled"
+freq_ruler = "← Frequency →"
+decoded_title = "Decoded"
+waiting_decode = "Waiting..."
+status_info_title = "Info"
+server = "Server:"
+hint = "Hint:"
+signal_strength = "Signal:"
+confidence = "Confidence:"
+audio_chunks = "Audio:"
+audio_queue = "Queue:"
+playback = "Playback:"
+playback_off = "Off (--play-audio)"
+playback_buffer = "Buffer:"
+audio_rms = "RMS:"
+audio_age = "Age:"
+reconnect_count = "Reconnects:"
+switch_count = "Switches:"
+hotkeys = "Keys:"
+hotkeys_value = "q Quit | b Back | l Language"
+last_update = "Updated:"
+seconds_ago = "{seconds:.1f}s ago"
+history = "History:"
+history_count = "{count}"
+
+[en.band_presets.40m]
+qrp_calling = "{freq:.3f} QRP Calling"
+common = "{freq:.3f} Common"
+
+[en.band_presets.20m]
+qrp_calling = "{freq:.3f} QRP Calling"
+ncdxf_beacon = "{freq:.3f} NCDXF Beacon"
+
+[en.band_presets.17m]
+ncdxf_beacon = "{freq:.3f} NCDXF Beacon"
+
+[en.band_presets.15m]
+qrp_calling = "{freq:.3f} QRP Calling"
+ncdxf_beacon = "{freq:.3f} NCDXF Beacon"
+
+[en.band_presets.12m]
+ncdxf_beacon = "{freq:.3f} NCDXF Beacon"
+
+[en.band_presets.10m]
+qrp_calling = "{freq:.3f} QRP Calling"
+ncdxf_beacon = "{freq:.3f} NCDXF Beacon"
+
+[ja.common]
+language_select_title = "表示言語を選択"
+language_zh = "中文"
+language_en = "English"
+language_ja = "日本語"
+menu_help = "↑↓ 選択 | Enter 決定 | Esc キャンセル"
+menu_help_monitor = "q 終了 | b 戻る | l 言語"
+press_ctrl_c_stop = "Ctrl+C で停止"
+
+[ja.home]
+title = "メインメニュー"
+help = "↑↓ 選択 | Enter 決定 | Esc 終了 | l 言語"
+monitor = "監視（デコード）"
+qso = "QSO（支援）"
+exit = "終了"
+select_server = "サーバーを選択"
+select_band = "バンドを選択"
+select_freq = "周波数を選択"
+callsign_prompt = "コールサイン（任意）"
+
+[ja.banner]
+subtitle = "AI支援 CW（モールス）通信ソフト"
+version = "バージョン: {version}"
+
+[ja.wizard]
+select_primary_server = "メインサーバーを選択"
+add_backup_server = "予備サーバーを追加しますか？"
+select_backup_server = "予備サーバーを選択"
+select_band = "バンドを選択"
+select_freq = "受信周波数を選択"
+not_add = "追加しない"
+add = "追加する"
+
+[ja.monitor]
+no_servers = "利用可能な KiwiSDR サーバーがありません"
+cli_missing_server = "--server/-s がありません。--wizard で対話選択してください"
+cli_missing_freq = "--freq/-f がありません。--wizard で対話選択してください"
+disconnecting = "切断中..."
+disconnected = "切断しました"
+connect_ok = "✓ KiwiSDR に接続しました"
+connect_failed_title = "接続失敗"
+connect_failed_body = "選択したサーバーに接続できません。戻って再選択してください。"
+connect_failed_any = "どの KiwiSDR にも接続できません"
+stop_listening = "停止中..."
+listen_error = "監視エラー: {error}"
+error_prefix = "エラー: {error}"
+connecting = "接続中"
+reconnecting = "再接続中"
+switching = "切替中"
+precheck_best = "事前確認：最良 {server}"
+precheck_learn = "学習：追加 {added} 無効化 {disabled}"
+switch_prepare = "サーバー不安定、切替 {old_server} → ..."
+switch_now = "サーバー不安定、切替 {old_server} → {new_server}"
+switch_failed = "切替失敗（{error}）、後で再試行"
+reconnect_audio_stalled = "音声が停止 {seconds:.1f}s、再接続中..."
+reconnect_failed_switching = "再接続失敗（{error}）、次へ切替..."
+reconnect_failed = "再接続失敗（{error}）"
+audio_paused_wait = "音声停止 {seconds:.1f}s、待機中..."
+
+[ja.qso]
+start = "QSO モード開始"
+server = "サーバー: [cyan]{server}[/cyan]"
+freq = "周波数: [yellow]{freq} MHz[/yellow]"
+callsign = "コールサイン: [blue]{callsign}[/blue]"
+waiting_cw = "CW 待機中..."
+suggestion = "[yellow]返信候補:[/yellow] [green]{suggestion}[/green]"
+stopping = "QSO 停止中..."
+error = "QSO エラー: {error}"
+
+[ja.dashboard]
+app_name = "EchoFist"
+app_tagline = "EchoFist"
+header_title = "状態"
+connected = "接続"
+disconnected = "未接続"
+waterfall_title = "ウォーターフォール"
+waterfall_disabled = "ウォーターフォール無効"
+freq_ruler = "← 周波数 →"
+decoded_title = "デコード"
+waiting_decode = "待機中..."
+status_info_title = "情報"
+server = "サーバー:"
+hint = "ヒント:"
+signal_strength = "信号:"
+confidence = "信頼度:"
+audio_chunks = "音声:"
+audio_queue = "キュー:"
+playback = "再生:"
+playback_off = "オフ (--play-audio)"
+playback_buffer = "バッファ:"
+audio_rms = "RMS:"
+audio_age = "経過:"
+reconnect_count = "再接続:"
+switch_count = "切替:"
+hotkeys = "キー:"
+hotkeys_value = "q 終了 | b 戻る | l 言語"
+last_update = "更新:"
+seconds_ago = "{seconds:.1f}s 前"
+history = "履歴:"
+history_count = "{count}"
+
+[ja.band_presets.40m]
+qrp_calling = "{freq:.3f} QRP コール"
+common = "{freq:.3f} よく使う"
+
+[ja.band_presets.20m]
+qrp_calling = "{freq:.3f} QRP コール"
+ncdxf_beacon = "{freq:.3f} NCDXF ビーコン"
+
+[ja.band_presets.17m]
+ncdxf_beacon = "{freq:.3f} NCDXF ビーコン"
+
+[ja.band_presets.15m]
+qrp_calling = "{freq:.3f} QRP コール"
+ncdxf_beacon = "{freq:.3f} NCDXF ビーコン"
+
+[ja.band_presets.12m]
+ncdxf_beacon = "{freq:.3f} NCDXF ビーコン"
+
+[ja.band_presets.10m]
+qrp_calling = "{freq:.3f} QRP コール"
+ncdxf_beacon = "{freq:.3f} NCDXF ビーコン"

@@ -73,6 +73,7 @@ class UIConfig(BaseModel):
     show_waterfall: bool = Field(True, description="显示瀑布图")
     show_signal_strength: bool = Field(True, description="显示信号强度")
     show_confidence: bool = Field(True, description="显示置信度")
+    language: str = Field("zh", description="界面语言（zh/en/ja）")
 
 
 class AppConfig(BaseModel):

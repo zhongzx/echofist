@@ -71,6 +71,12 @@ Issues = "https://github.com/echofist/echofist/issues"
 [project.scripts]
 echofist = "echofist.__main__:main"
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"echofist.ui" = ["*.toml"]
+
 [tool.black]
 line-length = 88
 target-version = ['py310']

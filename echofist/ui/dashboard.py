@@ -14,6 +14,7 @@ from rich.text import Text
 
 from echofist.config import load_config
 from echofist.logger import get_logger
+from echofist.ui.i18n import UILocalizer, get_ui_localizer
 
 
 @dataclass
@@ -45,9 +46,10 @@ class DashboardState:
 class Dashboard:
     """文本界面仪表板"""
 
-    def __init__(self):
+    def __init__(self, localizer: UILocalizer | None = None):
         self.logger = get_logger("dashboard")
         self.config = load_config().ui
+        self.localizer = localizer or get_ui_localizer(self.config.language)[0]
 
         # 状态
         self.state = DashboardState()
@@ -127,23 +129,24 @@ class Dashboard:
     def render_header(self) -> Panel:
         """渲染头部信息"""
         header_text = Text()
+        t = self.localizer.t
 
         # 应用名称
-        header_text.append("EchoFist ", style="bold cyan")
-        header_text.append("(回声手迹)", style="italic")
+        header_text.append(f'{t("dashboard.app_name")} ', style="bold cyan")
+        header_text.append(f'({t("dashboard.app_tagline")})', style="italic")
         header_text.append(" | ", style="dim")
 
         # 连接状态
-        state_text = self.state.connection_state
-        if state_text:
+        state_code = self.state.connection_state
+        if state_code:
             header_text.append("◐ ", style="bold yellow")
-            header_text.append(state_text, style="yellow")
+            header_text.append(t(f"monitor.{state_code}"), style="yellow")
         elif self.state.is_connected:
             header_text.append("● ", style="bold green")
-            header_text.append("已连接", style="green")
+            header_text.append(t("dashboard.connected"), style="green")
         else:
             header_text.append("○ ", style="bold red")
-            header_text.append("未连接", style="red")
+            header_text.append(t("dashboard.disconnected"), style="red")
 
         header_text.append(" | ", style="dim")
 
@@ -160,12 +163,21 @@ class Dashboard:
             header_text.append("⚠ ", style="bold red")
             header_text.append(self.state.error_message, style="red")
 
-        return Panel(header_text, title="状态", border_style="cyan")
+        return Panel(
+            header_text,
+            title=t("dashboard.header_title"),
+            border_style="cyan",
+        )
 
     def render_waterfall(self) -> Panel:
         """渲染瀑布图（文本版）"""
+        t = self.localizer.t
         if not self.config.show_waterfall:
-            return Panel(Text("瀑布图已禁用"), title="瀑布图", border_style="blue")
+            return Panel(
+                Text(t("dashboard.waterfall_disabled")),
+                title=t("dashboard.waterfall_title"),
+                border_style="blue",
+            )
 
         # 创建瀑布图文本
         waterfall_text = Text()
@@ -197,18 +209,26 @@ class Dashboard:
 
         # 添加频率标尺
         ruler = Text()
-        ruler.append(" " * 10 + "← 频率 →" + " " * 10, style="dim")
+        ruler.append(
+            " " * 10 + t("dashboard.freq_ruler") + " " * 10,
+            style="dim",
+        )
         waterfall_text.append(ruler)
 
-        return Panel(waterfall_text, title="瀑布图", border_style="blue")
+        return Panel(
+            waterfall_text,
+            title=t("dashboard.waterfall_title"),
+            border_style="blue",
+        )
 
     def render_decoded_text(self) -> Panel:
         """渲染解码文本"""
+        t = self.localizer.t
         # 创建解码文本显示
         decoded_panel = Text()
 
         if not self.history:
-            decoded_panel.append("等待解码...", style="dim")
+            decoded_panel.append(t("dashboard.waiting_decode"), style="dim")
         else:
             # 显示最近的历史记录
             for text, timestamp in reversed(self.history[-10:]):  # 显示最近10条
@@ -226,73 +246,91 @@ class Dashboard:
                 decoded_panel.append(text, style=style)
                 decoded_panel.append("\n")
 
-        return Panel(decoded_panel, title="解码文本", border_style="green")
+        return Panel(
+            decoded_panel,
+            title=t("dashboard.decoded_title"),
+            border_style="green",
+        )
 
     def render_status(self) -> Panel:
         """渲染状态信息"""
+        t = self.localizer.t
         status_table = Table(show_header=False, box=None)
 
         if self.state.server:
-            status_table.add_row("服务器:", self.state.server)
+            status_table.add_row(t("dashboard.server"), self.state.server)
 
         if self.state.error_message:
-            status_table.add_row("提示:", self.state.error_message)
+            status_table.add_row(t("dashboard.hint"), self.state.error_message)
 
         # 信号强度
         if self.config.show_signal_strength:
             signal_bar = self._create_signal_bar(self.state.signal_strength)
-            status_table.add_row("信号强度:", signal_bar)
+            status_table.add_row(t("dashboard.signal_strength"), signal_bar)
 
         # 置信度
         if self.config.show_confidence:
             confidence_bar = self._create_confidence_bar(self.state.confidence)
-            status_table.add_row("置信度:", confidence_bar)
+            status_table.add_row(t("dashboard.confidence"), confidence_bar)
 
         status_table.add_row(
-            "音频块:",
+            t("dashboard.audio_chunks"),
             f"{self.state.audio_chunks_total} "
             f"({self.state.audio_chunks_rate:.1f}/s)",
         )
         status_table.add_row(
-            "音频队列:",
+            t("dashboard.audio_queue"),
             f"{self.state.audio_queue_size}",
         )
         if not self.state.play_audio_enabled:
-            status_table.add_row("播放:", "关闭（加 --play-audio）")
+            status_table.add_row(
+                t("dashboard.playback"),
+                t("dashboard.playback_off"),
+            )
         status_table.add_row(
-            "播放缓冲:",
+            t("dashboard.playback_buffer"),
             f"{self.state.playback_buffer_ms:.0f}ms",
         )
         status_table.add_row(
-            "音频RMS:",
+            t("dashboard.audio_rms"),
             f"{self.state.audio_rms:.3f}",
         )
         status_table.add_row(
-            "音频年龄:",
+            t("dashboard.audio_age"),
             f"{self.state.audio_last_age:.2f}s",
         )
         status_table.add_row(
-            "重连次数:",
+            t("dashboard.reconnect_count"),
             f"{self.state.reconnect_count}",
         )
         status_table.add_row(
-            "切换次数:",
+            t("dashboard.switch_count"),
             f"{self.state.server_switch_count}",
         )
         status_table.add_row(
-            "快捷键:",
-            "q 退出 | b 返回设置",
+            t("dashboard.hotkeys"),
+            t("dashboard.hotkeys_value"),
         )
 
         # 最后更新时间
         if self.state.last_update > 0:
             elapsed = time.time() - self.state.last_update
-            status_table.add_row("最后更新:", f"{elapsed:.1f}秒前")
+            status_table.add_row(
+                t("dashboard.last_update"),
+                t("dashboard.seconds_ago", seconds=elapsed),
+            )
 
         # 历史记录计数
-        status_table.add_row("历史记录:", f"{len(self.history)}条")
+        status_table.add_row(
+            t("dashboard.history"),
+            t("dashboard.history_count", count=len(self.history)),
+        )
 
-        return Panel(status_table, title="状态信息", border_style="magenta")
+        return Panel(
+            status_table,
+            title=t("dashboard.status_info_title"),
+            border_style="magenta",
+        )
 
     def _create_signal_bar(self, strength: float) -> Text:
         """创建信号强度条"""
