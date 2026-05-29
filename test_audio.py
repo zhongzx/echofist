@@ -6,9 +6,12 @@
 
 import importlib
 import sys
+from collections.abc import Sequence
 
 import numpy as np
 import sounddevice as sd
+
+from echofist.core.audio_generation import generate_cw_wave, join_words
 
 
 def test_sounddevice() -> bool:
@@ -177,8 +180,110 @@ def test_audio_recording() -> bool:
         return False
 
 
+def play_cw_text(
+    text: str,
+    *,
+    wpm: float = 18.0,
+    tone_hz: float = 600.0,
+    sample_rate: int = 48000,
+    gain: float = 0.25,
+) -> None:
+    wave = generate_cw_wave(
+        text,
+        wpm=wpm,
+        tone_hz=tone_hz,
+        sample_rate=sample_rate,
+        gain=gain,
+    )
+    if wave.size == 0:
+        raise ValueError("CW 文本为空或无法生成")
+    sd.play(wave, int(sample_rate))
+    sd.wait()
+
+
+def _load_config_callsign() -> str | None:
+    try:
+        from echofist.config import load_config
+
+        cfg = load_config()
+        callsign = cfg.qso.default_callsign
+        if isinstance(callsign, str):
+            callsign = callsign.strip()
+        return callsign or None
+    except Exception:
+        return None
+
+
+def _parse_args(
+    argv: Sequence[str],
+) -> tuple[str | None, float, float, float, int, bool]:
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--cw",
+        nargs="+",
+        default=None,
+        help="播放指定文本的 CW 音频（可包含空格，例如 de bg5dnl cq）",
+    )
+    parser.add_argument(
+        "--cw-callsign",
+        action="store_true",
+        help="从本机 EchoFist 配置中读取默认呼号并播放 CW",
+    )
+    parser.add_argument("--wpm", type=float, default=18.0, help="CW 速度 (WPM)")
+    parser.add_argument("--tone", type=float, default=600.0, help="音调频率 (Hz)")
+    parser.add_argument("--gain", type=float, default=0.25, help="音量增益 (0-1)")
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=48000,
+        help="采样率 (Hz)",
+    )
+    args = parser.parse_args(list(argv))
+    cw_text: str | None
+    if args.cw is None:
+        cw_text = None
+    else:
+        cw_text = join_words(args.cw) or None
+    return (
+        cw_text,
+        float(args.wpm),
+        float(args.tone),
+        float(args.gain),
+        int(args.sample_rate),
+        bool(args.cw_callsign),
+    )
+
+
 def main() -> int:
     """主函数"""
+    cw_text, wpm, tone_hz, gain, sample_rate, cw_callsign = _parse_args(sys.argv[1:])
+    if cw_callsign and cw_text is None:
+        cw_text = _load_config_callsign()
+        if cw_text is None:
+            print("未在 EchoFist 配置中找到默认呼号")
+            print("可先运行: python -m echofist register")
+            print("或直接指定: python test_audio.py --cw <你的呼号>")
+            return 1
+
+    if cw_text is not None:
+        print("=== CW 播放测试 ===")
+        print(f"文本: {cw_text}")
+        print(f"WPM: {wpm}")
+        print(f"音调: {tone_hz} Hz")
+        print(f"采样率: {sample_rate} Hz")
+        print("正在播放...")
+        play_cw_text(
+            cw_text,
+            wpm=wpm,
+            tone_hz=tone_hz,
+            sample_rate=sample_rate,
+            gain=gain,
+        )
+        print("播放完成")
+        return 0
+
     print("EchoFist 音频功能测试")
     print("=" * 40)
 

@@ -5,9 +5,7 @@ AI辅助等幅电报（CW）通讯软件
 """
 
 import asyncio
-import math
 import sys
-import threading
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -38,6 +36,7 @@ except ModuleNotFoundError as e:
 try:
     from echofist import __version__
     from echofist.config import load_config
+    from echofist.core.audio_playback import AudioPlayer
     from echofist.core.kiwi_client import (
         KiwiReachabilityResult,
         KiwiSDRClient,
@@ -675,106 +674,6 @@ def _run_single_entry() -> None:
             return
 
 
-class AudioPlayer:
-    def __init__(
-        self,
-        input_rate: int,
-        *,
-        output_rate: int = 48000,
-        gain: float = 0.4,
-        max_buffer_seconds: float = 2.0,
-    ) -> None:
-        try:
-            import sounddevice as sd
-            from scipy.signal import resample_poly
-        except ImportError as e:
-            raise ImportError(
-                "Audio playback requires sounddevice and scipy. "
-                "Please install them with: pip install sounddevice scipy"
-            ) from e
-
-        self._sd = sd
-        self._resample_poly = resample_poly
-        self._input_rate = int(input_rate)
-        self._output_rate = int(output_rate)
-        self._gain = float(gain)
-        self._lock = threading.Lock()
-        self._buffer: deque[float] = deque()
-        self._max_samples = int(self._output_rate * max_buffer_seconds)
-        self._stream: Any | None = None
-        self._logger = setup_logger()
-
-        g = math.gcd(self._input_rate, self._output_rate)
-        self._up = self._output_rate // g
-        self._down = self._input_rate // g
-
-    def start(self) -> None:
-        def callback(
-            outdata: Any,
-            frames: int,
-            _time: Any,
-            status: Any,
-        ) -> None:
-            if status:
-                self._logger.warning(f"Audio callback status: {status}")
-            out = np.zeros(frames, dtype=np.float32)
-            with self._lock:
-                for i in range(frames):
-                    if not self._buffer:
-                        break
-                    out[i] = self._buffer.popleft()
-            outdata[:] = out.reshape(-1, 1)
-
-        self._stream = self._sd.OutputStream(
-            samplerate=self._output_rate,
-            channels=1,
-            dtype="float32",
-            callback=callback,
-            blocksize=1024,
-        )
-        self._stream.start()
-
-    def stop(self) -> None:
-        if self._stream is None:
-            return
-        try:
-            self._stream.stop()
-            self._stream.close()
-        except Exception as e:
-            self._logger.error(f"Error stopping audio stream: {e}")
-        finally:
-            self._stream = None
-
-    def buffered_ms(self) -> float:
-        with self._lock:
-            n = len(self._buffer)
-        return (n / float(self._output_rate)) * 1000.0
-
-    def clear(self) -> None:
-        with self._lock:
-            self._buffer.clear()
-
-    def feed(self, samples: np.ndarray) -> None:
-        if samples.size == 0:
-            return
-
-        x = np.asarray(samples, dtype=np.float32)
-        y = self._resample_poly(x, self._up, self._down).astype(
-            np.float32,
-            copy=False,
-        )
-        y = np.clip(y * self._gain, -1.0, 1.0)
-
-        with self._lock:
-            # 更高效地添加和裁剪
-            self._buffer.extend(float(v) for v in y)
-            overflow = len(self._buffer) - self._max_samples
-            if overflow > 0:
-                # 一次性移除多余的样本
-                for _ in range(overflow):
-                    self._buffer.popleft()
-
-
 def print_banner(localizer: UILocalizer | None = None) -> UILocalizer:
     """打印应用横幅"""
     if localizer is None:
@@ -1255,6 +1154,8 @@ async def monitor_mode(
                 refresh_per_second=4,
             ),
         ):
+            ui_refresh_interval = 1.0 / float(max(1.0, app_config.ui.refresh_rate))
+            last_render_at = time.monotonic() - ui_refresh_interval
             while True:
                 event = poller.get_event()
                 if event == "q":
@@ -1278,7 +1179,7 @@ async def monitor_mode(
                     continue
 
                 # 获取音频数据
-                audio_data = await client.get_audio_chunk(timeout_seconds=0.25)
+                audio_data = await client.get_audio_chunk(timeout_seconds=0.1)
                 now = asyncio.get_running_loop().time()
                 audio_age = client.get_last_audio_age_seconds()
                 if audio_age < 0.5:
@@ -1500,11 +1401,14 @@ async def monitor_mode(
                         reconnect_count=reconnect_count,
                         server_switch_count=server_switch_count,
                     )
-                    layout["header"].update(dashboard.render_header())
-                    layout["waterfall"].update(dashboard.render_waterfall())
-                    layout["decoded"].update(dashboard.render_decoded_text())
-                    layout["status"].update(dashboard.render_status())
-                    await asyncio.sleep(0.1)
+                    mono_now = time.monotonic()
+                    if mono_now - last_render_at >= ui_refresh_interval:
+                        last_render_at = mono_now
+                        layout["header"].update(dashboard.render_header())
+                        layout["waterfall"].update(dashboard.render_waterfall())
+                        layout["decoded"].update(dashboard.render_decoded_text())
+                        layout["status"].update(dashboard.render_status())
+                    await asyncio.sleep(0.05)
                     continue
                 drained = client.drain_audio_chunks(max_chunks=8)
                 if drained:
@@ -1544,13 +1448,15 @@ async def monitor_mode(
                     server_switch_count=server_switch_count,
                 )
 
-                # 渲染布局
-                layout["header"].update(dashboard.render_header())
-                layout["waterfall"].update(dashboard.render_waterfall())
-                layout["decoded"].update(dashboard.render_decoded_text())
-                layout["status"].update(dashboard.render_status())
+                mono_now = time.monotonic()
+                if mono_now - last_render_at >= ui_refresh_interval:
+                    last_render_at = mono_now
+                    layout["header"].update(dashboard.render_header())
+                    layout["waterfall"].update(dashboard.render_waterfall())
+                    layout["decoded"].update(dashboard.render_decoded_text())
+                    layout["status"].update(dashboard.render_status())
 
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0)
 
         return control
 
